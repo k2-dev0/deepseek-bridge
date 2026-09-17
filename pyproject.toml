@@ -1,0 +1,54 @@
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "deepseek-bridge"
+version = "0.1.0"
+description = "Repository-bound stdio MCP worker for DeepSeek Harness"
+requires-python = ">=3.12"
+dependencies = [
+  "deepseek-harness-sdk==0.1.5rc1",
+  "deepseek-harness-runtime-bin==0.1.5rc1",
+  "mcp==2.2.0",
+  "pydantic==2.12.5",
+  "PyYAML==6.0.2",
+  "platformdirs==4.4.0",
+]
+
+[project.scripts]
+deepseek-bridge = "deepseek_bridge.server:main"
+
+[dependency-groups]
+dev = [
+  "pytest==8.4.2", "pytest-asyncio==1.2.0", "ruff==0.13.0",
+  "mypy==1.18.1", "types-PyYAML==6.0.12.20250915",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/deepseek_bridge"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"profiles/privacy.cordis.yml" = "deepseek_bridge/profiles/privacy.cordis.yml"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+asyncio_mode = "auto"
+markers = ["wire: real Harness runtime and local HTTP endpoints (run outside sandbox)"]
+addopts = "-ra"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]
+
+[tool.mypy]
+python_version = "3.12"
+files = ["src/deepseek_bridge"]
+strict = true
+[[tool.mypy.overrides]]
+module = ["deepseek_harness.*", "deepseek_harness_runtime.*"]
+ignore_missing_imports = true
