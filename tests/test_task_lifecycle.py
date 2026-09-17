@@ -1,5 +1,6 @@
 import asyncio
 import threading
+from datetime import datetime, timedelta
 
 import pytest
 from conftest import final
@@ -117,4 +118,118 @@ async def test_concurrent_start_and_continue_have_one_winner(gate, repo):
         )
         assert sum(isinstance(v, dict) for v in values) == 1
     finally:
+        await manager.shutdown()
+
+
+def test_task_timeout_defaults(gate):
+    assert gate.HARD_TIMEOUT_SECONDS == 20 * 60
+    assert gate.INACTIVITY_TIMEOUT_SECONDS == 120
+
+
+def utc(value):
+    parsed = datetime.fromisoformat(value)
+    assert parsed.tzinfo is not None
+    assert parsed.utcoffset() == timedelta(0)
+    return parsed
+
+
+async def test_wait_snapshot_contract_and_poll_keeps_activity(gate, repo):
+    manager = gate.TaskManager(repo)
+    try:
+        task = await manager.start("Inspect the repository")
+        await wait_entered(manager.runtime)
+        snap = await manager.wait(task["task_id"], 0)
+        assert snap["status"] == "running"
+        for key in ("started_at", "last_activity_at", "elapsed_ms", "phase", "observability"):
+            assert key in snap, f"wait snapshot is missing {key}"
+        assert "progress" not in snap
+        assert snap["started_at"] is not None
+        assert snap["last_activity_at"] is not None
+        started = utc(snap["started_at"])
+        activity = utc(snap["last_activity_at"])
+        assert activity >= started
+        assert type(snap["elapsed_ms"]) is int
+        assert snap["elapsed_ms"] >= 0
+        assert isinstance(snap["phase"], str) and snap["phase"]
+        assert snap["observability"] in {"available", "unavailable"}
+        await manager.wait(task["task_id"], 1)
+        again = await manager.wait(task["task_id"], 0)
+        assert again["started_at"] == snap["started_at"]
+        assert again["last_activity_at"] == snap["last_activity_at"]
+        assert again["elapsed_ms"] >= snap["elapsed_ms"]
+        assert len(manager.runtime.calls) == 1
+    finally:
+        manager.runtime.release.set()
+        await manager.shutdown()
+
+
+async def test_task_hard_timeout_cleans_up_and_releases_reservation(gate, repo, monkeypatch):
+    monkeypatch.setattr(gate, "HARD_TIMEOUT_SECONDS", 0.5, raising=False)
+    monkeypatch.setattr(gate, "INACTIVITY_TIMEOUT_SECONDS", 60.0, raising=False)
+    manager = gate.TaskManager(repo)
+    try:
+        task = await manager.start("Long running work")
+        await wait_entered(manager.runtime)
+        result = await manager.wait(task["task_id"], 3000)
+        assert result["status"] == "failed"
+        assert result["error"]["class"] == "task_timeout_error"
+        assert result["final_response"] is None
+        assert manager.runtime.closed >= 1
+        assert not any(t.name.startswith("deepseek-worker") for t in threading.enumerate())
+        fresh = await manager.start("Fresh work after timeout cleanup")
+        assert (await manager.wait(fresh["task_id"], 1000))["status"] == "completed"
+    finally:
+        manager.runtime.release.set()
+        await manager.shutdown()
+
+
+async def test_task_inactivity_timeout_fires_without_activity(gate, repo, monkeypatch):
+    monkeypatch.setattr(gate, "HARD_TIMEOUT_SECONDS", 60.0, raising=False)
+    monkeypatch.setattr(gate, "INACTIVITY_TIMEOUT_SECONDS", 0.5, raising=False)
+    manager = gate.TaskManager(repo)
+    try:
+        task = await manager.start("Work without observable events")
+        await wait_entered(manager.runtime)
+        result = await manager.wait(task["task_id"], 3000)
+        assert result["status"] == "failed"
+        assert result["error"]["class"] == "task_timeout_error"
+        assert manager.runtime.closed >= 1
+    finally:
+        manager.runtime.release.set()
+        await manager.shutdown()
+
+
+async def test_continue_resets_run_clock_and_keeps_session(gate, repo):
+    manager = gate.TaskManager(repo)
+    try:
+        task = await manager.start("First run")
+        await wait_entered(manager.runtime)
+        first = await manager.wait(task["task_id"], 0)
+        assert first["status"] == "running"
+        manager.runtime.release.set()
+        completed = await manager.wait(task["task_id"], 1000)
+        assert completed["status"] == "completed"
+        for snapshot in (first, completed):
+            for key in ("started_at", "last_activity_at", "elapsed_ms", "phase", "observability"):
+                assert key in snapshot, f"wait snapshot is missing {key}"
+        await asyncio.sleep(1.05)
+        manager.runtime.entered.clear()
+        manager.runtime.release.clear()
+        assert (await manager.continue_task(task["task_id"], "Second run"))["status"] == "running"
+        await wait_entered(manager.runtime)
+        second = await manager.wait(task["task_id"], 0)
+        assert second["status"] == "running"
+        assert second["final_response"] is None
+        assert second["finish_reason"] is None
+        assert second["error"] is None
+        assert second["started_at"] > completed["started_at"]
+        assert second["last_activity_at"] >= second["started_at"]
+        assert second["elapsed_ms"] < 1000
+        manager.runtime.release.set()
+        assert (await manager.wait(task["task_id"], 1000))["status"] == "completed"
+        session_ids = [call[0] for call in manager.runtime.calls]
+        assert session_ids == [task["session_id"], task["session_id"]]
+        assert [call[2] for call in manager.runtime.calls] == [True, False]
+    finally:
+        manager.runtime.release.set()
         await manager.shutdown()
