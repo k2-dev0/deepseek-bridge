@@ -95,13 +95,39 @@ async def test_stdio_tools_and_invalid_inputs(repo, tmp_path, entrypoint):
 
 
 @pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGINT])
-async def test_signal_exits_while_client_keeps_stdin_open(repo, signum):
+@pytest.mark.parametrize("active", [False, True])
+@pytest.mark.parametrize("partial", [False, True])
+async def test_signal_exits_while_client_keeps_stdin_open(repo, signum, active, partial):
     bridge("server")
     env = {**os.environ, "DEEPSEEK_API_KEY": "signal-fixture-key"}
+    report = repo / "shutdown.json"
+    # Real stdio transport and TaskManager, with a controllably blocking SDK seam.
+    # The audit records only terminal status after the real shutdown has joined.
+    script = f"""
+import json, threading
+from pathlib import Path
+from deepseek_harness import RunResult
+from deepseek_bridge import tasks, server
+class Runtime:
+    def __init__(self, workspace):
+        self.done = threading.Event()
+    def run(self, session_id, message, fresh, stop):
+        self.done.wait(10)
+        return RunResult(session_id, '{{}}', 'completed', [], [])
+    def close(self):
+        self.done.set()
+tasks.Runtime = Runtime
+shutdown = tasks.TaskManager.shutdown
+async def audit(self):
+    await shutdown(self)
+    Path({str(report)!r}).write_text(json.dumps([t.status for t in self._tasks.values()]))
+tasks.TaskManager.shutdown = audit
+server.main()
+"""
     process = await asyncio.create_subprocess_exec(
         sys.executable,
-        "-m",
-        "deepseek_bridge",
+        "-c",
+        script,
         cwd=repo,
         env=env,
         stdin=asyncio.subprocess.PIPE,
@@ -123,8 +149,28 @@ async def test_signal_exits_while_client_keeps_stdin_open(repo, signum):
         await process.stdin.drain()
         reply = json.loads(await asyncio.wait_for(process.stdout.readline(), 10))
         assert reply["id"] == 1
+        if active:
+            process.stdin.write(b'{"jsonrpc":"2.0","method":"notifications/initialized"}\n')
+            process.stdin.write(
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "method": "tools/call",
+                        "params": {"name": "start_task", "arguments": {"brief": "Work"}},
+                    }
+                ).encode()
+                + b"\n"
+            )
+            await process.stdin.drain()
+            started = json.loads(await asyncio.wait_for(process.stdout.readline(), 10))
+            assert started["result"]["structuredContent"]["status"] == "running"
+        if partial:
+            process.stdin.write(b'{"jsonrpc": ')
+            await process.stdin.drain()
         process.send_signal(signum)
         assert await asyncio.wait_for(process.wait(), 2) == 0
+        assert json.loads(report.read_text()) == (["interrupted"] if active else [])
         assert b"signal-fixture-key" not in await process.stderr.read()
     finally:
         if process.returncode is None:
