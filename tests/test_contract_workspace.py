@@ -34,6 +34,9 @@ def test_workspace_binding(repo, monkeypatch, tmp_path):
         "sk-" + "a" * 32,
         "Authorization: Bearer value",
         "-----BEGIN PRIVATE KEY-----",
+        '{"password":"fixture-password-value"}',
+        '{"api_key":"fixture-other-key-value"}',
+        "{'access_token': 'fixture-access-token'}",
     ],
 )
 def test_input_rejected(text):
@@ -42,6 +45,9 @@ def test_input_rejected(text):
         protocol.StartInput(brief=text)
     with pytest.raises(ValueError):
         protocol.ContinueInput(task_id="task-x", message=text)
+    if len(text) <= 200:
+        with pytest.raises(ValueError):
+            protocol.StartInput(brief="safe task", title=text)
 
 
 def test_schema_and_boundaries(monkeypatch):
