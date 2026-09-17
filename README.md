@@ -180,7 +180,8 @@ SDK 0.1.5rc1のmacOS process inspectorはsetuid付き`/bin/ps`を使うため、
 
 `macos_process.mjs`が固定queryを照合し、隔離モードのPython helperがPID・親PID・開始時刻・foreground groupを読み取る。開始時刻を含むidentity比較を維持し、未知query・ABI不一致・自process treeの不可視は失敗する。通常のshellから`/bin/ps`を実行する権限は追加しない。
 
-SDK binary、system prompt、model-facing tool、Git保護・network policyは変更しない。Linuxは互換pluginを追加しない。macOSでも外部通信禁止のsandbox内で実shell編集・test・abort・shutdown回収のwire全10件を確認し、XFAIL/skipは解消した。
+SDK binary、system prompt、model-facing tool、Git保護・network policyは変更しない。Linuxは互換pluginを追加しない。2026-09-17の過去記録では、macOSでも外部通信禁止のsandbox内で実shell編集・test・abort・shutdown回収のwire全10件が成功し、XFAIL/skipを解消した。
+2026-09-18の再検証では、現在のhost wrapperにwire用の外側通信制限がなく、sandboxの二重起動が拒否された。SDK検証には到達しておらず、過去の成功を現在の保護環境で再現できてはいない。詳細は[VALIDATION.md](VALIDATION.md)。
 
 ## 検証
 
@@ -199,7 +200,7 @@ macOSの通常ターミナル、またはLinuxでbubblewrapが使える環境で
 ```
 
 このrunnerはloopback以外の通信をOSで禁止する。既にsandbox内の場合、macOSはsandboxの二重起動を拒否しうる。
-このrepositoryの開発環境では、ユーザーが外側の`.codex/hooks/shell/protected-exec.py`へ同じ通信制限を追加した上で、次を実行した。
+2026-09-17の過去検証では、ユーザーが外側の`.codex/hooks/shell/protected-exec.py`へ同じ通信制限を追加した上で、次を実行した。2026-09-18に確認した現在のwrapperにはその処理がなく、以下はexit 71となる。再実行には、Git metadata・agent設定の保護を残したまま、指定commandに限って外側でloopback制限を適用するhost側の修復が必要。
 
 ```bash
 bash .codex/hooks/shell/outside.sh '.venv/bin/python tests/wire_sandbox.py'
@@ -221,6 +222,7 @@ sh tests/linux_wire.sh
 bash .codex/hooks/shell/outside.sh 'sh tests/linux_wire.sh'
 ```
 
+以下は2026-09-17の過去のwire観測であり、2026-09-18の再検証で観測した結果ではない。
 観測した通常requestのfieldは`max_tokens/messages/model/reasoning_effort/stream/stream_options/thinking/tools`。
 modelは`deepseek-flash`、reasoning effortは`max`。通常入力とsession継続履歴が存在する。
 privacyを無効化し両pluginを有効にするnegative fixtureでは、これに`dsh_session_log/dsh_plugin_packages`が追加される。
