@@ -35,6 +35,7 @@ DeepSeek APIを利用するには、DeepSeek側のアカウント・API利用契
 Codex/ChatGPTの契約とは別のAPI利用になる。実APIへの接続は料金が発生しうる。wire testはlocal fixtureだけを使い、実API keyを必要としない。
 
 API keyは環境変数`DEEPSEEK_API_KEY`からだけ読む。shell履歴、tool引数、設定fileへkeyを貼らず、secret managerから環境へ渡す。
+ai-agent-rulesの起動scriptは環境変数を優先し、未設定ならzshの`.zshrc`を読み込んで保護付きbridgeへ渡す。`.zshrc`へ`export DEEPSEEK_API_KEY='...'`を書く方式は平文保存になるため、Git管理へ含めない。bridge本体はキーの保存方式に依存しない。
 通常は`DEEPSEEK_BASE_URL`を設定しない。DeepSeek互換のcustom endpointを使うときだけ設定する。
 URL内の認証情報・query・fragmentは受け付けない。環境や認証情報を含むdiagnosticをそのまま転送しない。
 
@@ -60,7 +61,7 @@ Git外、`/`、homeそのもの、symlinkのrepository rootを拒否する。起
 [mcp_servers.deepseek-worker]
 command = "bash"
 args = [
-  ".codex/hooks/shell/mcp-protected.sh",
+  ".codex/hooks/shell/deepseek-launch.sh",
   "/absolute/path/to/deepseek-bridge/.venv/bin/deepseek-bridge"
 ]
 startup_timeout_sec = 20
@@ -175,10 +176,11 @@ user-stateをtarget repository内へ設定した場合やbridge管理directory�
 共通指示のGit禁止もOSのアクセス制御ではない。host側で`.git`、agent設定、secret、workspace外のpathを保護し、必要な通信先だけを許可する。
 SDK `sdk-minimal`のlocal shellはhostの権限内で動く。API keyだけでなく親環境に他のcredentialを大量に渡さないこと。
 
-このmacOS環境では、SDK 0.1.5rc1のprocess inspectorがsetuid付き`/bin/ps`を必要とし、Seatbelt sandboxがその起動を`EPERM`で拒否する。
-**現在のmacOS保護wrapperのままではHarnessのshell編集は利用できない。** 当該実shellテストは明示的なXFAILとして報告する。
-bridgeはSDKを改変したり保護を自動解除したりしない。Linuxの隔離環境では実shellのcwd・編集・テスト・取消回収を検証している。
-macOSで使用する場合は、SDKと両立するhost sandboxを別途整備して再検証する必要がある。
+SDK 0.1.5rc1のmacOS process inspectorはsetuid付き`/bin/ps`を使うため、Seatbelt内でそのままでは起動できない。macOSでは実行専用のCordis pluginを追加し、SDK内部の2種類の同期process queryだけを、通常権限の`libproc` APIへ置き換える。
+
+`macos_process.mjs`が固定queryを照合し、隔離モードのPython helperがPID・親PID・開始時刻・foreground groupを読み取る。開始時刻を含むidentity比較を維持し、未知query・ABI不一致・自process treeの不可視は失敗する。通常のshellから`/bin/ps`を実行する権限は追加しない。
+
+SDK binary、system prompt、model-facing tool、Git保護・network policyは変更しない。Linuxは互換pluginを追加しない。macOSでも外部通信禁止のsandbox内で実shell編集・test・abort・shutdown回収のwire全10件を確認し、XFAIL/skipは解消した。
 
 ## 検証
 
@@ -225,6 +227,8 @@ privacyを無効化し両pluginを有効にするnegative fixtureでは、これ
 wire testはこのfield集合とSDK/runtime versionを固定して、更新時の差を検出する。
 canary API keyはAuthorization headerにだけ使われ、body・stdout・stderr・bridge error・通常session保存fileへの非露出を検査する。
 指定OTel collectorへのrequestは0件。外部egressはOSで拒否した。未知の送信先への**送信試行そのもの**の全件packet監査や、実DeepSeek serviceの保持方針までは検証しない。
+
+配布側との統合はai-agent-rulesの`tests/probe_deepseek_bridge.py --bridge-root <このrepository>`をこの環境のPythonで実行する。実MCP/DSH、ローカル模擬API、配布されたGit保護・非同期hookを通し、編集・test・継続・認証失敗・実shell取消と、回収失敗時に親のwriter制限が残ることを検証する。
 
 ## Errorとtroubleshooting
 
