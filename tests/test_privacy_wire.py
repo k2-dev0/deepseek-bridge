@@ -244,10 +244,6 @@ def test_real_shell_cwd_edit_and_test(endpoint, wire_env):
         message for message in endpoint["requests"][-1]["messages"] if message.get("role") == "tool"
     ]
     observed = json.dumps(tool_results)
-    if sys.platform == "darwin" and "spawnSync /bin/ps EPERM" in observed:
-        pytest.xfail(
-            "SDK 0.1.5rc1 shell requires /bin/ps; this sandbox blocks its setuid execution"
-        )
     assert (wire_env / "example.py").read_text() == "VALUE = 42\n"
     assert str(wire_env) in observed
     assert "Ran 1 test" in observed and "OK" in observed
@@ -318,7 +314,7 @@ async def test_real_abort_runtime_recreation_and_crash(endpoint, wire_env):
 
 
 @pytest.mark.skipif(
-    sys.platform != "linux", reason="Requires Linux process inspection; see macOS constraint"
+    sys.platform not in ("linux", "darwin"), reason="Requires POSIX process inspection"
 )
 @pytest.mark.parametrize("shutdown", [False, True])
 async def test_active_shell_reaped_on_abort_or_shutdown(endpoint, wire_env, shutdown):
