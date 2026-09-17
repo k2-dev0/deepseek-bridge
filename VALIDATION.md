@@ -12,10 +12,15 @@
 | `.venv/bin/ruff format --check src tests` | 16 files、成功 |
 | `bash .codex/hooks/shell/outside.sh '.venv/bin/python tests/wire_sandbox.py'`（sandbox外から実行） | exit 71、`sandbox-exec: sandbox_apply: Operation not permitted` |
 | 専用`code-reviewer`の準備 | exit 2、`preparation hook did not run; check project trust and hooks before continuing` |
+| `uv --cache-dir /private/tmp/deepseek-bridge-research/uv-cache build --offline`（出力先は一時領域） | exit 2、cacheの`sdists-v6/.git`への書込み用openをOSが拒否 |
+| 固定build backendのPEP 517 `build_sdist` / `build_wheel` | 0.1.1のsdist/wheel生成成功。既存cacheの固定5依存だけを読み、`outside.sh`内で実行 |
+| 配布物検査 | wheelの全source・macOS互換module・privacy正本が一致。sdistの文書・互換module・privacy正本が一致。両方とも`.codex/`・`.agents/`を含まない |
 
 wireはSDK起動前に停止した。現在の`protected-exec.py`には指定wire commandへのloopback制限と`BRIDGE_WIRE_SANDBOX_OUTER=1`設定がなく、`wire_sandbox.py`が内側のsandboxを起動する。外側wrapperによる設定照会自体は成功した。環境変数だけの手動設定やwrapperを外した実行では代用していない。uv cacheの書込み例外は、このwire経路の復旧には追加しない。
 
 独立レビューは未起動・未完了。projectはtrusted、`features.hooks=true`、専用roleも利用可能だが、Codex 0.154.0の`hooks/list`照会で`agent-input.sh`とレビュー用lifecycle hookは`modified`、一部の保護hookは`untrusted`だった。設定読込のerrors/warningsは空。project信頼の再登録ではなく、現在のhook定義をユーザーが確認して信頼する操作が必要。hook stateの直接作成や準備経路の迂回は行っていない。
+
+buildではGit保護やuv cacheの例外を追加していない。既存cacheにある`pyproject.toml`のbuild依存5件をexact versionで照合し、同じHatchling backendを直接使用した。`uv build`自体の成功とは区別する。生成物は検査用の一時領域に置き、公開していない。sdistの`AGENTS.md`は既存の未コミット変更を含む現在のworktree内容で、元fileの変更・commit・復元は行っていない。
 
 今回はrequest field、canary keyの非露出、OTel request数、実shell編集・test、実行中shellのabort/shutdown回収を再観測できていない。下記のmacOS全10件成功とLinux旧0.1.0の全10件成功は過去記録として残し、今回の成功には含めない。全送信先へのpacket監査、実DeepSeek serviceのデータ保持・請求・model品質も未確認。実APIへの追加疎通は行っていない。
 
