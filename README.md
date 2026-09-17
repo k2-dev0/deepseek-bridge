@@ -94,6 +94,7 @@ failed / aborted / interrupted        （終端）
 `wait_task`は`task_id/session_id/status/progress/final_response/finish_reason/error`を返す。
 `final_response`は次節の検証済みobjectまたはnull。`error`は短い`class/message`またはnull。
 running時の進捗は固定の短文だけで、modelのstreamやtool result全文を繰り返し返さない。
+stdioの1 request行は最大1 MiB。入力pipeは非同期に読み、JSON受信途中でもsignalによる終了を待たせない。
 
 同一process内では1 taskだけがwriter。start/continueの競合は片方を拒否する。
 複数bridge process間の分散lockはない。同じworkspaceへのbridge多重起動をhost側で防ぐこと。
