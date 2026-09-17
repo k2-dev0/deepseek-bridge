@@ -8,13 +8,14 @@ Python 3.12.8 / uv 0.5.9。SDK/runtimeは共に0.1.5rc1。
 - production code追加前に通常33件・wire6件がbridge未実装のassertionで失敗。
 - 各test fileを単独commitし、cleanな状態でbaseline `5ab46744b50b7418224e73239bca4bb30bde9f05`を記録。
 - JSON escapeで隠したcredential、completed時の空白questionについても失敗を確認してから修正。
-- 追加検証により現在のtest数は54件。
+- 独立レビューで指摘されたsignal終了とJSON形式credentialも失敗を再現してから修正。
+- 追加検証により現在のtest数は65件。
 
 ## 結果
 
 | 検証 | 結果 |
 |---|---|
-| 通常unit/integration、CLI module/console smoke | 44 passed |
+| 通常unit/integration、CLI module/console smoke | 55 passed |
 | Linux x64 real SDK wire（Docker、network none） | 10 passed |
 | macOS arm64 real SDK wire（loopback限定Seatbelt） | 7 passed、2 skipped、1 XFAIL |
 | mypy strict | 7 source files、診断なし |
@@ -51,6 +52,7 @@ privacy正本を適用せず、両metadata pluginを有効化したnegative fixt
 - Linuxの実行中shellに対するabort/shutdown後に子PIDが存在しないこと、worker threadが残らないことを確認。
 - 401/429/503/malformed streamはそれぞれ所定のsanitized error。各fixtureのmodel requestは1回。
 - runtime crash後はfailed。abort後のfresh taskでは新しいruntime PID。
+- SIGTERM/SIGINT、開いたstdin、受信途中のJSON、実行中taskを組み合わせた8条件で終了し、taskはinterruptedとなる。
 
 全外部宛ての**送信試行**をpacket captureで数えたわけではない。OSで外部egressを拒否し、設定したlocal collectorへの通信を観測した範囲の結果。
 実DeepSeek serviceのデータ保持・請求・実modelによる指示遵守は、この検証では確認していない。
