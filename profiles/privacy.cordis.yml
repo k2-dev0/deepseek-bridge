@@ -1,0 +1,11 @@
+- id: session-log-deepseek
+  name: '@deepseek-ai/dsh-session-log-deepseek'
+  config:
+    enabled: false
+- id: plugin-package-inventory-deepseek
+  name: '@deepseek-ai/dsh-plugin-package-inventory-deepseek'
+  config:
+    enabled: false
+- id: llm-retry
+  name: '@deepseek-ai/dsh-llm-retry'
+  disabled: true
