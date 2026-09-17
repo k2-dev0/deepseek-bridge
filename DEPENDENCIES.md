@@ -1,7 +1,7 @@
 # 固定dependency versions
 
 runtime / development依存は`uv.lock`のexact versionと配布hashで固定する。
-platform markerによりインストールされないpackageも含む。bridge自身は`0.1.0`。
+platform markerによりインストールされないpackageも含む。bridge自身は`0.1.1`。
 
 ```text
 annotated-types==0.8.0
