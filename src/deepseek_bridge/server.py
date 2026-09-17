@@ -8,6 +8,7 @@ import signal
 import sys
 from typing import Any
 
+from anyio import AsyncFile, CancelScope
 from mcp import types
 from mcp.server.lowlevel import Server
 from mcp.server.stdio import stdio_server
@@ -30,6 +31,17 @@ DESCRIPTIONS = {
     "continue_task": "Continue a completed or needs_decision task in the same Harness session.",
     "abort_task": "Stop the active task and reclaim its runtime; preserve worktree changes.",
 }
+
+
+class _PipeInput(AsyncFile[str]):
+    """A cancellable pipe reader for the official SDK's stdin stream argument."""
+
+    def __init__(self, reader: asyncio.StreamReader):
+        super().__init__(sys.stdin)
+        self.reader = reader
+
+    async def readline(self) -> str:
+        return (await self.reader.readline()).decode("utf-8", errors="replace")
 
 
 async def serve() -> None:
@@ -87,23 +99,41 @@ async def serve() -> None:
             installed.append(signum)
         except NotImplementedError:
             pass
+    transport: asyncio.ReadTransport | None = None
     try:
-        async with stdio_server() as (read, write):
-            connection = asyncio.create_task(
-                server.run(read, write, server.create_initialization_options())
+        # AsyncFile's default readline uses a non-abandonable worker thread.
+        # A live client pipe would hold stdio_server's task group open forever
+        # on signal shutdown. Keep input on the event loop so cancellation can
+        # release that group, including a partially received JSON line.
+        reader = asyncio.StreamReader(limit=1024 * 1024)
+        pipe = os.fdopen(os.dup(sys.stdin.fileno()), "rb", buffering=0)
+        try:
+            transport, _ = await loop.connect_read_pipe(
+                lambda: asyncio.StreamReaderProtocol(reader), pipe
             )
-            stopping = asyncio.create_task(stop.wait())
-            try:
-                done, _ = await asyncio.wait(
-                    {connection, stopping}, return_when=asyncio.FIRST_COMPLETED
+        except BaseException:
+            pipe.close()
+            raise
+        with CancelScope() as scope:
+            async with stdio_server(stdin=_PipeInput(reader)) as (read, write):
+                connection = asyncio.create_task(
+                    server.run(read, write, server.create_initialization_options())
                 )
-                if connection in done:
-                    await connection
-            finally:
-                connection.cancel()
-                stopping.cancel()
-                await asyncio.gather(connection, stopping, return_exceptions=True)
+                stopping = asyncio.create_task(stop.wait())
+                try:
+                    done, _ = await asyncio.wait(
+                        {connection, stopping}, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    if connection in done:
+                        await connection
+                finally:
+                    connection.cancel()
+                    stopping.cancel()
+                    await asyncio.gather(connection, stopping, return_exceptions=True)
+                    scope.cancel()
     finally:
+        if transport is not None:
+            transport.close()
         await manager.shutdown()
         for signum in installed:
             loop.remove_signal_handler(signum)
