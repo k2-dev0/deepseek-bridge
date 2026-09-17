@@ -194,6 +194,7 @@ name = "deepseek-bridge"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "anyio" },
     { name = "deepseek-harness-runtime-bin" },
     { name = "deepseek-harness-sdk" },
     { name = "mcp" },
@@ -213,6 +214,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "anyio", specifier = "==4.15.1" },
     { name = "deepseek-harness-runtime-bin", specifier = "==0.1.5rc1" },
     { name = "deepseek-harness-sdk", specifier = "==0.1.5rc1" },
     { name = "mcp", specifier = "==2.2.0" },
