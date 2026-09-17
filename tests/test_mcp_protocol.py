@@ -9,6 +9,17 @@ import pytest
 from conftest import bridge
 
 
+def server_cwd(repo):
+    if (repo / ".git").exists():
+        return repo
+    # Sandboxes that deny creating .git still expose the checked-out worktree;
+    # read-only tools/list and rejected inputs never write into it.
+    fallback = Path(__file__).resolve().parents[1]
+    if not (fallback / ".git").exists():
+        pytest.skip("no git worktree is available for the MCP server")
+    return fallback
+
+
 @pytest.mark.parametrize("entrypoint", ["module", "console"])
 async def test_stdio_tools_and_invalid_inputs(repo, tmp_path, entrypoint):
     bridge("server")
@@ -24,7 +35,7 @@ async def test_stdio_tools_and_invalid_inputs(repo, tmp_path, entrypoint):
     )
     process = await asyncio.create_subprocess_exec(
         *command,
-        cwd=repo,
+        cwd=server_cwd(repo),
         env=env,
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
@@ -65,6 +76,35 @@ async def test_stdio_tools_and_invalid_inputs(repo, tmp_path, entrypoint):
             schema = tool["inputSchema"]
             assert schema["additionalProperties"] is False
             assert not {"workspace", "model", "provider", "profile"} & schema["properties"].keys()
+        wait_tool = next(tool for tool in listed if tool["name"] == "wait_task")
+        output_schema = wait_tool.get("outputSchema")
+        assert output_schema, "wait_task must publish the new snapshot output schema"
+        properties = output_schema["properties"]
+        for field in (
+            "task_id",
+            "session_id",
+            "status",
+            "final_response",
+            "finish_reason",
+            "error",
+            "started_at",
+            "last_activity_at",
+            "elapsed_ms",
+            "phase",
+            "observability",
+        ):
+            assert field in properties, f"wait_task output schema is missing {field}"
+        assert "progress" not in properties
+        required = set(output_schema.get("required", []))
+        assert {
+            "status",
+            "started_at",
+            "last_activity_at",
+            "elapsed_ms",
+            "phase",
+            "observability",
+        } <= required
+        assert properties["observability"].get("enum") == ["available", "unavailable"]
         for index, arguments in enumerate(
             (
                 {"brief": " "},
@@ -97,10 +137,10 @@ async def test_stdio_tools_and_invalid_inputs(repo, tmp_path, entrypoint):
 @pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGINT])
 @pytest.mark.parametrize("active", [False, True])
 @pytest.mark.parametrize("partial", [False, True])
-async def test_signal_exits_while_client_keeps_stdin_open(repo, signum, active, partial):
+async def test_signal_exits_while_client_keeps_stdin_open(repo, tmp_path, signum, active, partial):
     bridge("server")
     env = {**os.environ, "DEEPSEEK_API_KEY": "signal-fixture-key"}
-    report = repo / "shutdown.json"
+    report = tmp_path / "shutdown.json"
     # Real stdio transport and TaskManager, with a controllably blocking SDK seam.
     # The audit records only terminal status after the real shutdown has joined.
     script = f"""
@@ -109,9 +149,9 @@ from pathlib import Path
 from deepseek_harness import RunResult
 from deepseek_bridge import tasks, server
 class Runtime:
-    def __init__(self, workspace):
+    def __init__(self, workspace, *args, **kwargs):
         self.done = threading.Event()
-    def run(self, session_id, message, fresh, stop):
+    def run(self, session_id, message, fresh, stop, *args, **kwargs):
         self.done.wait(10)
         return RunResult(session_id, '{{}}', 'completed', [], [])
     def close(self):
@@ -128,7 +168,7 @@ server.main()
         sys.executable,
         "-c",
         script,
-        cwd=repo,
+        cwd=server_cwd(repo),
         env=env,
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
