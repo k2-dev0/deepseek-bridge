@@ -1,4 +1,27 @@
-# 検証記録 — 2026-09-17
+# 検証記録
+
+## 2026-09-18 — 現在の保護環境での再検証
+
+対象HEADは`b5e66c6c6a14574d22d2425e1b0c32ffcc90f60a`。macOS arm64、bridge 0.1.1、SDK/runtime 0.1.5rc1。既存のmacOS互換処理は変更していない。
+
+| 検証 | 今回の結果 |
+|---|---|
+| `.venv/bin/python -m pytest -m 'not wire' -q` | 58 passed, 10 deselected |
+| `.venv/bin/mypy` | 8 source files、診断なし |
+| `.venv/bin/ruff check src tests` | 成功 |
+| `.venv/bin/ruff format --check src tests` | 16 files、成功 |
+| `bash .codex/hooks/shell/outside.sh '.venv/bin/python tests/wire_sandbox.py'`（sandbox外から実行） | exit 71、`sandbox-exec: sandbox_apply: Operation not permitted` |
+| 専用`code-reviewer`の準備 | exit 2、`preparation hook did not run; check project trust and hooks before continuing` |
+
+wireはSDK起動前に停止した。現在の`protected-exec.py`には指定wire commandへのloopback制限と`BRIDGE_WIRE_SANDBOX_OUTER=1`設定がなく、`wire_sandbox.py`が内側のsandboxを起動する。外側wrapperによる設定照会自体は成功した。環境変数だけの手動設定やwrapperを外した実行では代用していない。uv cacheの書込み例外は、このwire経路の復旧には追加しない。
+
+独立レビューは未起動・未完了。projectはtrusted、`features.hooks=true`、専用roleも利用可能だが、Codex 0.154.0の`hooks/list`照会で`agent-input.sh`とレビュー用lifecycle hookは`modified`、一部の保護hookは`untrusted`だった。設定読込のerrors/warningsは空。project信頼の再登録ではなく、現在のhook定義をユーザーが確認して信頼する操作が必要。hook stateの直接作成や準備経路の迂回は行っていない。
+
+今回はrequest field、canary keyの非露出、OTel request数、実shell編集・test、実行中shellのabort/shutdown回収を再観測できていない。下記のmacOS全10件成功とLinux旧0.1.0の全10件成功は過去記録として残し、今回の成功には含めない。全送信先へのpacket監査、実DeepSeek serviceのデータ保持・請求・model品質も未確認。実APIへの追加疎通は行っていない。
+
+host wrapperの限定修復とhook信頼確認後に、同じ保護経路でmacOS wire全10件を再実行し、最終HEADまでの専用roleレビューを完了する必要がある。
+
+## 2026-09-17 — 過去の検証記録
 
 Python 3.12.8 / uv 0.5.9。SDK/runtimeは共に0.1.5rc1。
 通常・wire検証はmodel endpointだけをlocal HTTP/SSE fixtureへ置き換え、Harness SDKとruntimeは実物を起動した。追加で、ユーザー設定の環境変数を使った実APIの短い疎通2回を実施した。
@@ -80,5 +103,5 @@ sh tests/linux_wire.sh
 ```
 
 この開発環境の外部実行はREADMEの`outside.sh`経由commandを用いた。
-ユーザーが適用した`.codex/hooks/shell/protected-exec.py`の変更は、uv一時cacheのmarker 1個への例外と、wire検証commandへのloopback制限。
+当時の記録にある`.codex/hooks/shell/protected-exec.py`の変更は、uv一時cacheのmarker 1個への例外と、wire検証commandへのloopback制限。2026-09-18に確認した現在のfileには、どちらも存在しない。
 `.codex/`は既存方針どおり管理外で、アプリの配布物には含めない。
