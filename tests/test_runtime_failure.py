@@ -1,8 +1,9 @@
 import asyncio
+import logging
+import os
 import threading
 
 import pytest
-
 from conftest import bridge, final
 
 
@@ -83,3 +84,73 @@ def test_privacy_environment_overrides_parent(monkeypatch):
     assert child["DSH_TELEMETRY_MODE"] == "DISABLED"
     assert child["DSH_TELEMETRY_DISABLED"] == "1"
     assert child["OTEL_SDK_DISABLED"] == "true"
+
+
+async def test_abort_during_sdk_initialization_never_runs_a_turn(tmp_path, monkeypatch):
+    runtime = bridge("runtime")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "initialization-canary")
+    monkeypatch.setattr(bridge("privacy"), "user_state_path", lambda *a, **k: tmp_path / "state")
+    entered, release = threading.Event(), threading.Event()
+    calls = []
+
+    class Client:
+        _proc = None
+
+    class Harness:
+        client = Client()
+
+        def __init__(self, **kwargs):
+            pass
+
+        def start(self):
+            entered.set()
+            assert release.wait(3)
+
+        def start_session(self, session_id):
+            return self
+
+        def run(self, prompt):
+            calls.append("run")
+            raise AssertionError("Cancelled initialization must not reach a model turn")
+
+        def close(self):
+            calls.append("close")
+
+    monkeypatch.setattr(runtime, "DeepSeekHarness", Harness)
+    manager = bridge("tasks").TaskManager(tmp_path / "repo")
+    try:
+        task = await manager.start("Work")
+        assert await asyncio.to_thread(entered.wait, 2)
+        abort = asyncio.create_task(manager.abort(task["task_id"]))
+        await asyncio.sleep(0.02)
+        release.set()
+        assert (await asyncio.wait_for(abort, 3))["status"] == "aborted"
+        assert calls == ["close"]
+    finally:
+        release.set()
+        await manager.shutdown()
+
+
+def test_reject_invalid_privacy_patch(monkeypatch):
+    privacy = bridge("privacy")
+    monkeypatch.setattr(privacy.Path, "read_text", lambda self: "- id: missing\n")
+    with pytest.raises(bridge("protocol").BridgeError, match="privacy_configuration_error"):
+        privacy.privacy_patch()
+
+
+def test_cli_normal_files_are_private(tmp_path, monkeypatch):
+    server = bridge("server")
+    created = tmp_path / "bridge-created-file"
+
+    async def fixture_serve():
+        created.write_text("metadata")
+
+    monkeypatch.setattr(server, "serve", fixture_serve)
+    previous_mask = os.umask(0o022)
+    previous_logging = logging.root.manager.disable
+    try:
+        server.main()
+        assert created.stat().st_mode & 0o777 == 0o600
+    finally:
+        os.umask(previous_mask)
+        logging.disable(previous_logging)
