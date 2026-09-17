@@ -1,0 +1,223 @@
+"""Real SDK + bundled runtime; HTTP fixtures replace only the remote provider."""
+
+import asyncio
+import importlib.metadata
+import json
+import threading
+import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import pytest
+from conftest import bridge, final
+from deepseek_harness import DeepSeekHarness
+
+pytestmark = pytest.mark.wire
+KEY = "wire-only-canary-" + "a" * 24
+
+
+@pytest.fixture
+def endpoint():
+    captured = {
+        "requests": [],
+        "otel": [],
+        "mode": "ok",
+        "arrived": threading.Event(),
+        "release": threading.Event(),
+        "authorization": [],
+    }
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_POST(self):
+            raw = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            if self.path != "/chat/completions":
+                captured["otel"].append(self.path)
+                self.send_response(200)
+                self.end_headers()
+                return
+            body = json.loads(raw)
+            captured["requests"].append(body)
+            captured["authorization"].append(self.headers.get("Authorization") == "Bearer " + KEY)
+            captured["arrived"].set()
+            mode = captured["mode"]
+            if mode == "hang":
+                captured["release"].wait(15)
+                return
+            if isinstance(mode, int):
+                self.send_response(mode)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(
+                    json.dumps({"error": {"message": "test failure", "code": mode}}).encode()
+                )
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            if mode == "malformed":
+                self.wfile.write(b"data: {malformed}\n\ndata: [DONE]\n\n")
+                return
+            chunk = {
+                "id": "wire-fixture",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "deepseek-flash",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"role": "assistant", "content": final()},
+                        "finish_reason": None,
+                    }
+                ],
+            }
+            self.wfile.write(("data: " + json.dumps(chunk) + "\n\n").encode())
+            chunk["choices"] = [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+            chunk["usage"] = {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20}
+            self.wfile.write(("data: " + json.dumps(chunk) + "\n\ndata: [DONE]\n\n").encode())
+            self.wfile.flush()
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    captured["url"] = f"http://127.0.0.1:{server.server_port}"
+    try:
+        yield captured
+    finally:
+        captured["release"].set()
+        server.shutdown()
+        server.server_close()
+        thread.join(2)
+
+
+@pytest.fixture
+def wire_env(endpoint, monkeypatch, tmp_path):
+    p = bridge("privacy")
+    monkeypatch.setattr(p, "user_state_path", lambda *args, **kwargs: tmp_path / "state")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", KEY)
+    monkeypatch.setenv("DEEPSEEK_BASE_URL", endpoint["url"])
+    monkeypatch.setenv("DSH_TELEMETRY_MODE", "FEEDBACK_ONLY")
+    monkeypatch.setenv("DSH_TELEMETRY_DISABLED", "0")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", endpoint["url"] + "/otel")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT", endpoint["url"] + "/v1/logs")
+    workspace = tmp_path / "worktree"
+    workspace.mkdir()
+    return workspace
+
+
+def test_real_wire_privacy_and_unpatched_difference(endpoint, wire_env, capfd, tmp_path):
+    runtime = bridge("runtime")
+    runner = runtime.Runtime(wire_env)
+    try:
+        first = runner.run(
+            "session-" + uuid.uuid4().hex, "WIRE_CANARY normal input", True, threading.Event()
+        )
+        assert first.finish_reason == "completed"
+        assert json.loads(first.final_response)["status"] == "completed"
+        safe = endpoint["requests"][0]
+        assert safe["model"] == "deepseek-flash"
+        assert safe["reasoning_effort"] == "max"
+        assert "dsh_session_log" not in safe
+        assert "dsh_plugin_packages" not in safe
+        assert "WIRE_CANARY" in json.dumps(safe["messages"])
+        assert KEY not in json.dumps(safe)
+        assert endpoint["authorization"] == [True]
+        assert "AGENTS.md" in json.dumps(safe["messages"])
+        second = runner.run(first.session_id, "CONTINUATION_CANARY", False, threading.Event())
+        assert second.session_id == first.session_id
+        assert "WIRE_CANARY" in json.dumps(endpoint["requests"][-1]["messages"])
+    finally:
+        runner.close()
+    # No privacy patch. Deliberately opt in to BOTH plugins so the test proves
+    # each field's mechanism, including the session-log default-off version.
+    unsafe = tmp_path / "unsafe.yml"
+    unsafe.write_text(
+        "\n".join(
+            [
+                "- id: session-log-deepseek",
+                "  name: '@deepseek-ai/dsh-session-log-deepseek'",
+                "  config:",
+                "    enabled: true",
+                "- id: plugin-package-inventory-deepseek",
+                "  name: '@deepseek-ai/dsh-plugin-package-inventory-deepseek'",
+                "  config:",
+                "    enabled: true",
+                "",
+            ]
+        )
+    )
+    with DeepSeekHarness(
+        dsh_home=str(tmp_path / "unsafe-home"),
+        cwd=str(wire_env),
+        profile="sdk-minimal",
+        provider="deepseek-official",
+        model="deepseek-flash",
+        reasoning_effort="max",
+        patches=(str(unsafe),),
+        env={"DSH_TELEMETRY_MODE": "DISABLED", "DSH_TELEMETRY_DISABLED": "1"},
+    ) as harness:
+        harness.run("NEGATIVE_CANARY", session_id="session-" + uuid.uuid4().hex)
+    negative = endpoint["requests"][-1]
+    assert "dsh_plugin_packages" in negative
+    assert "dsh_session_log" in negative
+    assert not endpoint["otel"]
+    assert KEY not in "".join(capfd.readouterr())
+    for path in (tmp_path / "state").rglob("*"):
+        if path.is_file():
+            assert KEY.encode() not in path.read_bytes()
+    assert importlib.metadata.version("deepseek-harness-sdk") == "0.1.5rc1"
+    assert importlib.metadata.version("deepseek-harness-runtime-bin") == "0.1.5rc1"
+
+
+@pytest.mark.parametrize(
+    "mode,category",
+    [
+        (401, "authentication_error"),
+        (429, "transport_error"),
+        (503, "transport_error"),
+        ("malformed", "harness_protocol_error"),
+    ],
+)
+async def test_real_api_errors(endpoint, wire_env, mode, category):
+    endpoint["mode"] = mode
+    manager = bridge("tasks").TaskManager(wire_env)
+    try:
+        task = await manager.start("Exercise failure classification")
+        result = await manager.wait(task["task_id"], 15000)
+        assert result["status"] == "failed", result
+        assert result["error"]["class"] == category, result
+        assert KEY not in str(result)
+        assert len(endpoint["requests"]) == 1
+    finally:
+        await manager.shutdown()
+
+
+async def test_real_abort_runtime_recreation_and_crash(endpoint, wire_env):
+    endpoint["mode"] = "hang"
+    manager = bridge("tasks").TaskManager(wire_env)
+    try:
+        task = await manager.start("Wait until aborted")
+        assert await asyncio.to_thread(endpoint["arrived"].wait, 10)
+        process = manager.runtime.harness.client._proc
+        assert process.poll() is None
+        assert (await manager.abort(task["task_id"]))["status"] == "aborted"
+        assert process.poll() is not None
+        endpoint["mode"] = "ok"
+        endpoint["arrived"].clear()
+        fresh = await manager.start("Fresh runtime")
+        assert (await manager.wait(fresh["task_id"], 15000))["status"] == "completed"
+        process2 = manager.runtime.harness.client._proc
+        assert process2.pid != process.pid
+        endpoint["mode"] = "hang"
+        endpoint["arrived"].clear()
+        crash = await manager.start("Runtime crash")
+        assert await asyncio.to_thread(endpoint["arrived"].wait, 10)
+        process2.kill()
+        failed = await manager.wait(crash["task_id"], 15000)
+        assert failed["status"] == "failed"
+        assert failed["error"]["class"] == "harness_protocol_error"
+        assert process2.poll() is not None
+    finally:
+        await manager.shutdown()
+    assert not any(t.name.startswith("deepseek-worker") for t in threading.enumerate())
