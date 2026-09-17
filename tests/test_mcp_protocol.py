@@ -4,20 +4,25 @@ import os
 import sys
 from pathlib import Path
 
+import pytest
 from conftest import bridge
 
 
-async def test_stdio_tools_and_invalid_inputs(repo, tmp_path):
+@pytest.mark.parametrize("entrypoint", ["module", "console"])
+async def test_stdio_tools_and_invalid_inputs(repo, tmp_path, entrypoint):
     bridge("server")
     env = {
         **os.environ,
         "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"),
         "DEEPSEEK_API_KEY": "mcp-fixture-key",
     }
+    command = (
+        [sys.executable, "-m", "deepseek_bridge"]
+        if entrypoint == "module"
+        else [str(Path(sys.executable).parent / "deepseek-bridge")]
+    )
     process = await asyncio.create_subprocess_exec(
-        sys.executable,
-        "-m",
-        "deepseek_bridge",
+        *command,
         cwd=repo,
         env=env,
         stdin=asyncio.subprocess.PIPE,
