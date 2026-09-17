@@ -46,7 +46,7 @@ class BridgeError(Exception):
 
 
 _CREDENTIAL = re.compile(
-    r"(?:\b[A-Za-z0-9_-]*(?:api[_-]?key|access[_-]?token|password|secret)\s*[=:]\s*\S+)"
+    r"(?:\b[A-Za-z0-9_-]*(?:api[_-]?key|access[_-]?token|password|secret)[\"']?\s*[=:]\s*\S+)"
     r"|(?:\b(?:sk-|gh[pousr]_|github_pat_|AKIA)[A-Za-z0-9_/-]{12,})"
     r"|(?:authorization\s*:)|(?:bearer\s+\S+)|(?:-----BEGIN .*PRIVATE KEY-----)",
     re.IGNORECASE,
