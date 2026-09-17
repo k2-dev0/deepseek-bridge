@@ -1,8 +1,12 @@
 """Real SDK + bundled runtime; HTTP fixtures replace only the remote provider."""
 
 import asyncio
+import errno
 import importlib.metadata
 import json
+import os
+import socket
+import sys
 import threading
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -72,8 +76,27 @@ def endpoint():
                     }
                 ],
             }
+            tool_turn = mode in ("tool", "slowtool") and not any(
+                message.get("role") == "tool" for message in body["messages"]
+            )
+            if tool_turn:
+                tool = body["tools"][0]["function"]
+                arguments = json.dumps({"command": captured["command"]})
+                chunk["choices"][0]["delta"] = {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": "fixture-call",
+                            "type": "function",
+                            "function": {"name": tool["name"], "arguments": arguments},
+                        }
+                    ],
+                }
             self.wfile.write(("data: " + json.dumps(chunk) + "\n\n").encode())
-            chunk["choices"] = [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+            chunk["choices"] = [
+                {"index": 0, "delta": {}, "finish_reason": "tool_calls" if tool_turn else "stop"}
+            ]
             chunk["usage"] = {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20}
             self.wfile.write(("data: " + json.dumps(chunk) + "\n\ndata: [DONE]\n\n").encode())
             self.wfile.flush()
@@ -113,9 +136,20 @@ def test_real_wire_privacy_and_unpatched_difference(endpoint, wire_env, capfd, t
         first = runner.run(
             "session-" + uuid.uuid4().hex, "WIRE_CANARY normal input", True, threading.Event()
         )
+        first_process = runner.harness.client._proc
         assert first.finish_reason == "completed"
         assert json.loads(first.final_response)["status"] == "completed"
         safe = endpoint["requests"][0]
+        assert set(safe) == {
+            "max_tokens",
+            "messages",
+            "model",
+            "reasoning_effort",
+            "stream",
+            "stream_options",
+            "thinking",
+            "tools",
+        }
         assert safe["model"] == "deepseek-flash"
         assert safe["reasoning_effort"] == "max"
         assert "dsh_session_log" not in safe
@@ -126,7 +160,12 @@ def test_real_wire_privacy_and_unpatched_difference(endpoint, wire_env, capfd, t
         assert "AGENTS.md" in json.dumps(safe["messages"])
         second = runner.run(first.session_id, "CONTINUATION_CANARY", False, threading.Event())
         assert second.session_id == first.session_id
+        assert runner.harness.client._proc is first_process
         assert "WIRE_CANARY" in json.dumps(endpoint["requests"][-1]["messages"])
+        independent = runner.run("session-" + uuid.uuid4().hex, "NEW_TASK", True, threading.Event())
+        assert independent.session_id != first.session_id
+        assert runner.harness.client._proc is first_process
+        assert "WIRE_CANARY" not in json.dumps(endpoint["requests"][-1]["messages"])
     finally:
         runner.close()
     # No privacy patch. Deliberately opt in to BOTH plugins so the test proves
@@ -168,6 +207,61 @@ def test_real_wire_privacy_and_unpatched_difference(endpoint, wire_env, capfd, t
             assert KEY.encode() not in path.read_bytes()
     assert importlib.metadata.version("deepseek-harness-sdk") == "0.1.5rc1"
     assert importlib.metadata.version("deepseek-harness-runtime-bin") == "0.1.5rc1"
+    print(
+        "WIRE_OBSERVATION "
+        + json.dumps(
+            {
+                "sdk": importlib.metadata.version("deepseek-harness-sdk"),
+                "fields": sorted(safe),
+                "model": safe["model"],
+                "reasoning_effort": safe["reasoning_effort"],
+                "negative_fields": sorted(negative),
+                "key_body_exposed": KEY in json.dumps(safe),
+                "otel_collector_requests": len(endpoint["otel"]),
+                "egress_enforced": os.environ.get("BRIDGE_WIRE_SANDBOX") == "1",
+            },
+            sort_keys=True,
+        )
+    )
+
+
+def test_real_shell_cwd_edit_and_test(endpoint, wire_env):
+    endpoint["mode"] = "tool"
+    # The fixture model asks the REAL Harness shell tool to perform bounded work.
+    endpoint["command"] = (
+        "pwd; printf 'VALUE = 42\\n' > example.py; "
+        "printf 'import unittest\\nfrom example import VALUE\\n"
+        "class Check(unittest.TestCase):\\n def test_value(self): self.assertEqual(VALUE, 42)\\n' "
+        "> test_example.py; " + sys.executable + " -m unittest -v test_example"
+    )
+    runner = bridge("runtime").Runtime(wire_env)
+    try:
+        runner.run("session-" + uuid.uuid4().hex, "Run the fixture test", True, threading.Event())
+    finally:
+        runner.close()
+    assert len(endpoint["requests"]) == 2
+    tool_results = [
+        message for message in endpoint["requests"][-1]["messages"] if message.get("role") == "tool"
+    ]
+    observed = json.dumps(tool_results)
+    if sys.platform == "darwin" and "spawnSync /bin/ps EPERM" in observed:
+        pytest.xfail(
+            "SDK 0.1.5rc1 shell requires /bin/ps; this sandbox blocks its setuid execution"
+        )
+    assert (wire_env / "example.py").read_text() == "VALUE = 42\n"
+    assert str(wire_env) in observed
+    assert "Ran 1 test" in observed and "OK" in observed
+    assert not (wire_env / ".git").exists()
+
+
+def test_wire_egress_guard():
+    if os.environ.get("BRIDGE_WIRE_SANDBOX") != "1":
+        pytest.skip("egress boundary unverified; use tests/wire_sandbox.py")
+    with socket.socket() as probe:
+        probe.settimeout(0.5)
+        with pytest.raises(OSError) as denied:
+            probe.connect(("192.0.2.1", 443))
+        assert denied.value.errno in {errno.EPERM, errno.EACCES, errno.ENETUNREACH}
 
 
 @pytest.mark.parametrize(
@@ -221,3 +315,34 @@ async def test_real_abort_runtime_recreation_and_crash(endpoint, wire_env):
     finally:
         await manager.shutdown()
     assert not any(t.name.startswith("deepseek-worker") for t in threading.enumerate())
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux", reason="Requires Linux process inspection; see macOS constraint"
+)
+@pytest.mark.parametrize("shutdown", [False, True])
+async def test_active_shell_reaped_on_abort_or_shutdown(endpoint, wire_env, shutdown):
+    endpoint["mode"] = "slowtool"
+    endpoint["command"] = "printf '%s\\n' $$ > shell.pid; sleep 120"
+    manager = bridge("tasks").TaskManager(wire_env)
+    task = await manager.start("Run a bounded cancellation fixture")
+    try:
+        marker = wire_env / "shell.pid"
+        for _ in range(200):
+            if marker.exists():
+                break
+            await asyncio.sleep(0.05)
+        assert marker.exists(), "the real shell did not start"
+        pid = int(marker.read_text())
+        if shutdown:
+            await manager.shutdown()
+            expected = "interrupted"
+        else:
+            assert (await manager.abort(task["task_id"]))["status"] == "aborted"
+            expected = "aborted"
+        assert (await manager.wait(task["task_id"], 0))["status"] == expected
+        with pytest.raises(ProcessLookupError):
+            os.kill(pid, 0)
+        assert not any(t.name.startswith("deepseek-worker") for t in threading.enumerate())
+    finally:
+        await manager.shutdown()
