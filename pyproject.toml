@@ -11,6 +11,7 @@ version = "0.1.0"
 description = "Repository-bound stdio MCP worker for DeepSeek Harness"
 requires-python = ">=3.12"
 dependencies = [
+  "anyio==4.15.1",
   "deepseek-harness-sdk==0.1.5rc1",
   "deepseek-harness-runtime-bin==0.1.5rc1",
   "mcp==2.2.0",
