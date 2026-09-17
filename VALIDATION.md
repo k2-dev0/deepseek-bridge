@@ -1,7 +1,7 @@
 # 検証記録 — 2026-09-17
 
 Python 3.12.8 / uv 0.5.9。SDK/runtimeは共に0.1.5rc1。
-実APIへの課金を伴う接続は実行していない。model endpointだけをlocal HTTP/SSE fixtureへ置き換え、Harness SDKとruntimeは実物を起動した。
+通常・wire検証はmodel endpointだけをlocal HTTP/SSE fixtureへ置き換え、Harness SDKとruntimeは実物を起動した。追加で、ユーザー設定の環境変数を使った実APIの短い疎通2回を実施した。
 
 ## TDD
 
@@ -9,23 +9,24 @@ Python 3.12.8 / uv 0.5.9。SDK/runtimeは共に0.1.5rc1。
 - 各test fileを単独commitし、cleanな状態でbaseline `5ab46744b50b7418224e73239bca4bb30bde9f05`を記録。
 - JSON escapeで隠したcredential、completed時の空白questionについても失敗を確認してから修正。
 - 独立レビューで指摘されたsignal終了とJSON形式credentialも失敗を再現してから修正。
-- 追加検証により現在のtest数は65件。
+- 追加検証により現在のtest数は68件。
 
 ## 結果
 
 | 検証 | 結果 |
 |---|---|
-| 通常unit/integration、CLI module/console smoke | 55 passed |
-| Linux x64 real SDK wire（Docker、network none） | 10 passed |
-| macOS arm64 real SDK wire（loopback限定Seatbelt） | 7 passed、2 skipped、1 XFAIL |
-| mypy strict | 7 source files、診断なし |
+| 通常unit/integration、CLI module/console smoke | 58 passed |
+| Linux x64 real SDK wire（Docker、network none、旧0.1.0の記録） | 10 passed |
+| macOS arm64 real SDK wire（loopback限定Seatbelt） | 10 passed |
+| mypy strict | 8 source files、診断なし |
 | Ruff lint / format | 診断なし |
 | `uv lock --check --offline` | lock一致、47 package（bridge自身含む） |
-| `uv build` | sdist/wheel生成成功 |
-| wheel inspection | privacy profileが正本と一致、controller fileを含まない |
+| `uv build` | 0.1.1のsdist/wheel生成成功 |
+| wheel inspection | privacy profile・macOS互換moduleが正本と一致、controller fileを含まない |
 
-macOS XFAILは実shell起動時の`spawnSync /bin/ps EPERM`。SDKのsetuid process inspectionとこのhost sandboxの非互換であり、shell成功とは扱わない。
-2件のskipはLinux専用の実行中shellのabort/shutdown回収検証。同じ2件はLinuxで通過した。
+macOSの旧XFAIL/skipは、SDK内部のprocess queryをlibprocへ渡す実行専用pluginで解消した。OS sandbox内のshell編集・test・取消・shutdown回収を実行し、全10件が成功した。SDK binaryやmodel-facing toolは変更していない。
+
+ai-agent-rulesの統合probeでも、実stdio MCPと実SDKを配布保護wrapperで起動し、編集・test・Git書き込み拒否・同session継続・401・実shell取消を確認した。別fixtureでruntime回収後に失敗を注入し、`failed + abort_error`で親のwriter制限を解除しないことを確認した。storageだけを一時領域へ向け、実APIは呼んでいない。
 
 ## Wireの観測結果
 
@@ -55,7 +56,17 @@ privacy正本を適用せず、両metadata pluginを有効化したnegative fixt
 - SIGTERM/SIGINT、開いたstdin、受信途中のJSON、実行中taskを組み合わせた8条件で終了し、taskはinterruptedとなる。
 
 全外部宛ての**送信試行**をpacket captureで数えたわけではない。OSで外部egressを拒否し、設定したlocal collectorへの通信を観測した範囲の結果。
-実DeepSeek serviceのデータ保持・請求・実modelによる指示遵守は、この検証では確認していない。
+実DeepSeek serviceのデータ保持・請求額・一般の開発taskにおける指示遵守は、この検証では確認していない。
+
+## 実API疎通
+
+ユーザーが`.zshrc`へ設定したAPI keyを環境変数として取得し、値は出力・記録しなかった。
+
+- 公式Chat Completionsへ固定の短文を1回送信：HTTP 200、応答は期待した`OK`。入力9・出力1、合計10 tokens。
+- 配布の起動script→Git保護wrapper→実stdio MCP→実DSH sdk-minimal→公式APIへ1回送信：`deepseek-flash` / `max`で`completed`、期待したJSONと一致。
+- 後者は空の一時repositoryと一時stateだけを使用し、file読込・tool実行を要求しなかった。ユーザーのコードは送信していない。
+
+開発作業の品質や長時間taskの成功を、この疎通から推定しない。Linuxの今回の再実行は行っていない。
 
 ## 再現command
 
