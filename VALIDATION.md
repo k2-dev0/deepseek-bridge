@@ -12,7 +12,7 @@
 | `.venv/bin/ruff format --check src tests` | 16 files、成功 |
 | `bash .codex/hooks/shell/outside.sh '.venv/bin/python tests/wire_sandbox.py'`（sandbox外から実行） | 10 passed, 58 deselected、18.15秒。skip/XFAILなし |
 | Codex `hooks/list`による設定照会 | project hookは全てenabled/trusted、errors/warningsなし |
-| 専用`code-reviewer`の正規準備・起動 | 準備は成功。起動は既存`AGENTS.md`変更に対するclean判定で拒否され、レビュー未実施 |
+| 専用`code-reviewer`の正規準備・初回起動 | 準備は成功。初回起動は既存`AGENTS.md`変更に対するclean判定で拒否 |
 | `uv --cache-dir /private/tmp/deepseek-bridge-research/uv-cache build --offline`（出力先は一時領域） | exit 2、cacheの`sdists-v6/.git`への書込み用openをOSが拒否 |
 | 固定build backendのPEP 517 `build_sdist` / `build_wheel` | 0.1.1のsdist/wheel生成成功。既存cacheの固定5依存だけを読み、`outside.sh`内で実行 |
 | 配布物検査 | wheelの全source・macOS互換module・privacy正本が一致。sdistの文書・互換module・privacy正本が一致。両方とも`.codex/`・`.agents/`を含まない |
@@ -23,7 +23,9 @@
 
 レビュー準備も復旧前には`exit 2: preparation hook did not run; check project trust and hooks before continuing`だった。projectはtrusted、`features.hooks=true`、専用roleは利用可能だったが、準備・レビューlifecycle hookが`modified`、一部保護hookが`untrusted`だった。ユーザーによるhook信頼確認後のCodex 0.154.0照会では、全project hookがenabled/trustedで読込errors/warningsなし。hook stateの直接作成や準備経路の迂回は行っていない。独立コードレビューは、この検証表とは別に最終HEADを固定して実施する。
 
-信頼確認後の`agent-input.py prepare code-reviewer`は成功したが、`2e07ab1c44826164dbd1f967f2ca718e41f42b2e`から`c85e94780622222f7ddb9b5e70dab78a1bf1b164`を対象とした専用role起動は、`independent-review.sh`の全追跡fileをcleanとする条件で拒否された。残る変更は作業開始前からあるユーザーの`AGENTS.md`だけであり、保持指定のためcommit・復元していない。reviewerは未起動で、指摘なしという結果ではない。ユーザー変更を保持しつつ起動条件を整えた後、最終HEADまでのレビューが必要。
+信頼確認後の`agent-input.py prepare code-reviewer`は成功したが、`2e07ab1c44826164dbd1f967f2ca718e41f42b2e`から`c85e94780622222f7ddb9b5e70dab78a1bf1b164`を対象とした専用roleの初回起動は、`independent-review.sh`の全追跡fileをcleanとする条件で拒否された。残る変更は作業開始前からあるユーザーの`AGENTS.md`だけであり、保持指定のためcommit・復元していない。この拒否を指摘なしのレビュー結果とは扱わない。
+
+ユーザーがレビューhookの限定差分を適用したことも確認した。現在のrepositoryとこのtask IDに限り、未stageの変更が`AGENTS.md`だけで、mode変更なし・内容が確認済みSHA-256と一致する状態を起動時と結果受理時に許容する。stage済み変更、追加file、既存変更の消失・内容変更は拒否し、他task/repositoryでは元のclean条件を維持する。Git・agent設定のOS保護と正規の準備・専用role・契約注入経路は維持する。独立レビューの結果は、これらの文書変更も含む最終HEADを対象に別途報告する。
 
 buildではGit保護やuv cacheの例外を追加していない。既存cacheにある`pyproject.toml`のbuild依存5件をexact versionで照合し、同じHatchling backendを直接使用した。`uv build`自体の成功とは区別する。生成物は検査用の一時領域に置き、公開していない。sdistの`AGENTS.md`は既存の未コミット変更を含む現在のworktree内容で、元fileの変更・commit・復元は行っていない。
 
