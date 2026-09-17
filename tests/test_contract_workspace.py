@@ -77,6 +77,7 @@ def test_schema_and_boundaries(monkeypatch):
         final(tests=["x"] * 51),
         final(affected_paths=["../secret"]),
         final(question="unnecessary"),
+        final(question=" "),
         final("needs_decision", question=None),
         final(unresolved="wrong type"),
         "x" * 16001,
