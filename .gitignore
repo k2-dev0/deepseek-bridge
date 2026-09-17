@@ -1,0 +1,11 @@
+.agents/
+.codex/
+.venv/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+uv-cache-exception.patch
