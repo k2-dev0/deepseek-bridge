@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import signal
 import sys
 from pathlib import Path
 
@@ -91,3 +92,42 @@ async def test_stdio_tools_and_invalid_inputs(repo, tmp_path, entrypoint):
         if process.returncode is None:
             process.kill()
             await process.wait()
+
+
+@pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGINT])
+async def test_signal_exits_while_client_keeps_stdin_open(repo, signum):
+    bridge("server")
+    env = {**os.environ, "DEEPSEEK_API_KEY": "signal-fixture-key"}
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-m",
+        "deepseek_bridge",
+        cwd=repo,
+        env=env,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        initialize = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": "signal-fixture", "version": "1"},
+            },
+        }
+        process.stdin.write((json.dumps(initialize) + "\n").encode())
+        await process.stdin.drain()
+        reply = json.loads(await asyncio.wait_for(process.stdout.readline(), 10))
+        assert reply["id"] == 1
+        process.send_signal(signum)
+        assert await asyncio.wait_for(process.wait(), 2) == 0
+        assert b"signal-fixture-key" not in await process.stderr.read()
+    finally:
+        if process.returncode is None:
+            process.kill()
+            await process.wait()
+        process.stdin.close()
