@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 import threading
@@ -154,3 +155,87 @@ def test_cli_normal_files_are_private(tmp_path, monkeypatch):
     finally:
         os.umask(previous_mask)
         logging.disable(previous_logging)
+
+
+async def test_sdk_event_wakes_wait_and_updates_activity_without_payload_leak(sdk_gate, repo):
+    manager = bridge("tasks").TaskManager(repo)
+    try:
+        task = await manager.start("Inspect the repository")
+        assert await asyncio.to_thread(sdk_gate.entered.wait, 2)
+        before = await manager.wait(task["task_id"], 0)
+        assert before["status"] == "running"
+        waiter = asyncio.create_task(manager.wait(task["task_id"], 5000))
+        await asyncio.sleep(1.1)
+        sdk_gate.notify("turn/start", canary="sdk-notification-canary-9f3")
+        woken = await asyncio.wait_for(waiter, 2)
+        assert woken["status"] == "running"
+        assert woken["observability"] in {"available", "unavailable"}
+        assert isinstance(woken["phase"], str) and woken["phase"]
+        assert woken["last_activity_at"] is not None
+        assert woken["last_activity_at"] > before["last_activity_at"]
+        assert "progress" not in woken
+        assert "sdk-notification-canary-9f3" not in json.dumps(before)
+        assert "sdk-notification-canary-9f3" not in json.dumps(woken)
+    finally:
+        sdk_gate.release.set()
+        await manager.shutdown()
+
+
+async def test_timeout_cleanup_failure_keeps_reservation(gate, repo, monkeypatch):
+    monkeypatch.setattr(gate, "HARD_TIMEOUT_SECONDS", 0.5, raising=False)
+    monkeypatch.setattr(gate, "INACTIVITY_TIMEOUT_SECONDS", 60.0, raising=False)
+    manager = gate.TaskManager(repo)
+    task = await manager.start("Work")
+    assert await asyncio.to_thread(manager.runtime.entered.wait, 2)
+    close = manager.runtime.close
+
+    def broken_close():
+        raise RuntimeError("timeout-cleanup-canary")
+
+    monkeypatch.setattr(manager.runtime, "close", broken_close)
+    result = await manager.wait(task["task_id"], 3000)
+    assert result["status"] == "failed"
+    assert result["error"]["class"] == "abort_error"
+    assert "timeout-cleanup-canary" not in str(result)
+    with pytest.raises(gate.BridgeError):
+        await manager.start("Must not overlap unreleased writer")
+    monkeypatch.setattr(manager.runtime, "close", close)
+    await manager.shutdown()
+    assert not any(t.name.startswith("deepseek-worker") for t in threading.enumerate())
+
+
+async def test_turn_end_transport_failure_is_transport_error(sdk_gate, repo):
+    sdk_gate.response = ""
+    sdk_gate.finish_reason = "error"
+    sdk_gate.events = [
+        {
+            "type": "turn/end",
+            "data": {
+                "turn": 1,
+                "reason": {
+                    "kind": "error",
+                    "error": {"code": "TRANSPORT", "message": "transport-canary-detail"},
+                },
+            },
+        }
+    ]
+    manager = bridge("tasks").TaskManager(repo)
+    try:
+        task = await manager.start("Exercise transport classification")
+        assert await asyncio.to_thread(sdk_gate.entered.wait, 2)
+        sdk_gate.release.set()
+        result = await manager.wait(task["task_id"], 2000)
+        assert result["status"] == "failed"
+        assert result["error"]["class"] == "transport_error"
+        assert "transport-canary-detail" not in json.dumps(result)
+    finally:
+        sdk_gate.release.set()
+        await manager.shutdown()
+
+
+def test_common_instructions_batch_reads_without_rereading():
+    lowered = bridge("protocol").COMMON_INSTRUCTIONS.lower()
+    assert "search" in lowered
+    assert "same step" in lowered
+    assert "re-read" in lowered or "reread" in lowered
+    assert "already read" in lowered
