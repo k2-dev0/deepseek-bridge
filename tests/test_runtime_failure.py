@@ -1,0 +1,85 @@
+import asyncio
+import threading
+
+import pytest
+
+from conftest import bridge, final
+
+
+@pytest.mark.parametrize("failure", [FileNotFoundError("secret path"), RuntimeError("secret init")])
+async def test_startup_failures_are_sanitized(tmp_path, monkeypatch, failure):
+    runtime = bridge("runtime")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "only-env-canary")
+    monkeypatch.setattr(bridge("privacy"), "user_state_path", lambda *a, **k: tmp_path / "state")
+
+    def unavailable():
+        raise failure
+
+    monkeypatch.setattr(runtime, "bundled_runtime_path", unavailable)
+    manager = bridge("tasks").TaskManager(tmp_path / "repo")
+    try:
+        task = await manager.start("Exercise runtime initialization failure")
+        result = await manager.wait(task["task_id"], 2000)
+        assert result["status"] == "failed"
+        assert result["error"]["class"] == "harness_start_error"
+        assert "secret" not in str(result)
+        with pytest.raises(bridge("protocol").BridgeError):
+            await manager.continue_task(task["task_id"], "Retry")
+    finally:
+        await manager.shutdown()
+
+
+async def test_abort_cleanup_failure_poisoned_writer(gate, repo, monkeypatch):
+    manager = gate.TaskManager(repo)
+    task = await manager.start("Work")
+    assert await asyncio.to_thread(manager.runtime.entered.wait, 2)
+    close = manager.runtime.close
+
+    def broken_close():
+        raise RuntimeError("credential-like raw close error")
+
+    monkeypatch.setattr(manager.runtime, "close", broken_close)
+    with pytest.raises(gate.BridgeError, match="abort_error"):
+        await manager.abort(task["task_id"])
+    result = await manager.wait(task["task_id"], 0)
+    assert result["status"] == "failed"
+    assert result["error"]["class"] == "abort_error"
+    assert "credential-like" not in str(result)
+    with pytest.raises(gate.BridgeError):
+        await manager.start("Must not overlap orphaned worker")
+    monkeypatch.setattr(manager.runtime, "close", close)
+    await manager.shutdown()
+    assert not any(t.name.startswith("deepseek-worker") for t in threading.enumerate())
+
+
+async def test_cancelled_wait_leaves_task_running(gate, repo):
+    manager = gate.TaskManager(repo)
+    try:
+        task = await manager.start("Work")
+        waiter = asyncio.create_task(manager.wait(task["task_id"], 60000))
+        await asyncio.sleep(0)
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        assert (await manager.wait(task["task_id"], 0))["status"] == "running"
+        manager.runtime.release.set()
+        assert (await manager.wait(task["task_id"], 1000))["status"] == "completed"
+    finally:
+        await manager.shutdown()
+
+
+def test_escaped_secret_in_model_json_is_rejected(monkeypatch):
+    p = bridge("protocol")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "escaped-credential-canary")
+    text = final(summary="escaped-credential-canary").replace("escaped-", "escaped\\u002d")
+    with pytest.raises(p.BridgeError, match="task_contract_error"):
+        p.parse_final(text)
+
+
+def test_privacy_environment_overrides_parent(monkeypatch):
+    monkeypatch.setenv("DSH_TELEMETRY_MODE", "FEEDBACK_ONLY")
+    monkeypatch.setenv("DSH_TELEMETRY_DISABLED", "0")
+    child = bridge("privacy").child_environment()
+    assert child["DSH_TELEMETRY_MODE"] == "DISABLED"
+    assert child["DSH_TELEMETRY_DISABLED"] == "1"
+    assert child["OTEL_SDK_DISABLED"] == "true"
