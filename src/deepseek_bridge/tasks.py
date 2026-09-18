@@ -391,13 +391,17 @@ class TaskManager:
             self._transition(task, status)
             self._active = None
 
-    async def _recover_resources(self, task: Task) -> None:
+    async def _recover_resources(self, task: Task | None) -> None:
         # The graceful close may block indefinitely on a stuck SDK pipe write;
         # every wait below is bounded, and a pending close task is never cancelled.
         process = self.runtime.owned_process()
-        close_task = asyncio.create_task(asyncio.to_thread(self.runtime.close))
-        self._pending_close.add(close_task)
-        close_task.add_done_callback(self._pending_close.discard)
+        # Reuse an unfinished close task: its stuck thread may still own the
+        # runtime lifecycle lock, so starting a second close would only block.
+        close_task = next((pending for pending in self._pending_close if not pending.done()), None)
+        if close_task is None:
+            close_task = asyncio.create_task(asyncio.to_thread(self.runtime.close))
+            self._pending_close.add(close_task)
+            close_task.add_done_callback(self._pending_close.discard)
         done, _ = await asyncio.wait({close_task}, timeout=CLEANUP_GRACE_SECONDS)
         if not done:
             # Force-stop only the captured owned process so close can unblock,
@@ -412,7 +416,7 @@ class TaskManager:
             raise BridgeError("abort_error")
         if process is not None and process.poll() is None:
             raise BridgeError("abort_error")
-        if task.worker is not None:
+        if task is not None and task.worker is not None:
             done, _ = await asyncio.wait({task.worker}, timeout=CLEANUP_JOIN_SECONDS)
             if not done:
                 raise BridgeError("abort_error")
@@ -468,7 +472,10 @@ class TaskManager:
             if task is not None and task.status == "running":
                 await self._stop(task, "interrupted")
             else:
-                await asyncio.to_thread(self.runtime.close)
-                if self._executor is not None:
-                    await asyncio.to_thread(self._executor.shutdown, wait=True, cancel_futures=True)
-                    self._executor = None
+                # A terminal task may still hold the reservation after a failed
+                # cleanup, and an idle runtime/executor must be reclaimed too.
+                # Reuse a stuck pending close instead of starting a second one;
+                # publish reclamation only after the bounded recovery succeeds.
+                await self._recover_resources(task)
+                async with self._condition:
+                    self._active = None
