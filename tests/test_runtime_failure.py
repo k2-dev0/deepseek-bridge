@@ -227,7 +227,7 @@ class _FakeProcess:
 def _prepare_timeout_recovery(gate, repo, monkeypatch, mode):
     monkeypatch.setattr(gate, "CLEANUP_GRACE_SECONDS", 0.05)
     monkeypatch.setattr(gate, "CLEANUP_JOIN_SECONDS", 0.1)
-    monkeypatch.setattr(gate, "EXECUTOR_JOIN_SECONDS", 0.5)
+    monkeypatch.setattr(gate, "CLEANUP_FORCE_SECONDS", 0.5)
     monkeypatch.setattr(gate, "HARD_TIMEOUT_SECONDS", 0.05, raising=False)
     monkeypatch.setattr(gate, "INACTIVITY_TIMEOUT_SECONDS", 60.0, raising=False)
     manager = gate.TaskManager(repo)
@@ -318,7 +318,7 @@ async def test_timeout_bounded_cleanup_failure_keeps_reservation(gate, repo, mon
 def _prepare_terminal_cleanup_failure(gate, repo, monkeypatch):
     monkeypatch.setattr(gate, "CLEANUP_GRACE_SECONDS", 0.05)
     monkeypatch.setattr(gate, "CLEANUP_JOIN_SECONDS", 0.1)
-    monkeypatch.setattr(gate, "EXECUTOR_JOIN_SECONDS", 0.5)
+    monkeypatch.setattr(gate, "CLEANUP_FORCE_SECONDS", 0.5)
     monkeypatch.setattr(gate, "HARD_TIMEOUT_SECONDS", 0.05, raising=False)
     monkeypatch.setattr(gate, "INACTIVITY_TIMEOUT_SECONDS", 60.0, raising=False)
     manager = gate.TaskManager(repo)
@@ -359,9 +359,9 @@ async def test_shutdown_is_bounded_while_terminal_cleanup_stays_stuck(gate, repo
         with pytest.raises(gate.BridgeError, match="abort_error"):
             await asyncio.wait_for(manager.shutdown(), 3)
         assert time.monotonic() - started < 3
-        # A failed reclamation keeps the reservation, poison and executor.
+        # A failed reclamation keeps the reservation, poison and run ownership.
         assert manager._active is manager._tasks[task["task_id"]]
-        assert manager._executor is not None
+        assert manager._run_call is not None
         terminal = await manager.wait(task["task_id"], 0)
         assert terminal["status"] == "failed"
         assert terminal["error"]["class"] == "abort_error"
@@ -382,8 +382,9 @@ async def test_shutdown_reclaims_terminal_cleanup_after_release(gate, repo, monk
     await asyncio.wait_for(manager.shutdown(), 3)
     # Only a successful re-recovery publishes reclamation; the task stays failed.
     assert manager._active is None
-    assert manager._executor is None
-    assert manager._pending_close == set()
+    assert manager._run_call is None
+    assert manager._close_call is None
+    assert manager._force_call is None
     terminal = await manager.wait(task["task_id"], 0)
     assert terminal["status"] == "failed"
     assert terminal["error"]["class"] == "abort_error"
