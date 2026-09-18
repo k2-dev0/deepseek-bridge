@@ -18,7 +18,7 @@ from deepseek_harness_runtime import bundled_runtime_path
 
 from .macos_process import runtime_patch
 from .privacy import child_environment, prepare_state, privacy_patch
-from .protocol import COMMON_INSTRUCTIONS, BridgeError, ErrorClass
+from .protocol import BridgeError, ErrorClass
 
 SDK_VERSION = "0.1.5rc1"
 MODEL = "deepseek-flash"
@@ -200,7 +200,9 @@ class Runtime:
         if stop.is_set():
             raise BridgeError("abort_error")
         report("run_start")
-        prompt = COMMON_INSTRUCTIONS + "\nTask:\n" + message if fresh else message
+        # `fresh` stays in the signature for TaskManager compatibility. The common
+        # instructions live once in the child system prompt (DSH_SYSTEM_PROMPT);
+        # both fresh and continued runs forward the caller's message unchanged.
 
         def on_notification(notification: Notification) -> None:
             token = notification_activity(notification, session_id)
@@ -210,7 +212,7 @@ class Runtime:
         try:
             # Session.run does not lazily start a runtime. A close between the
             # check above and this call fails the send; it cannot resurrect it.
-            result: RunResult = session.run(prompt, on_notification=on_notification)
+            result: RunResult = session.run(message, on_notification=on_notification)
         except (SdkProtocolError, TransportClosedError):
             raise BridgeError("harness_protocol_error") from None
         except JsonRpcError as error:
