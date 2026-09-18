@@ -29,6 +29,9 @@ from .runtime import Runtime
 
 HARD_TIMEOUT_SECONDS = 20 * 60
 INACTIVITY_TIMEOUT_SECONDS = 120
+# SDK 0.1.5rc1 does not forward agent/assistant-stream frames over its RPC.
+# Keep model waiting bounded without treating an invisible stream as a tool stall.
+MODEL_WAIT_TIMEOUT_SECONDS = 600
 # Fixed bounds for graceful close, owned-process force stop and joins.
 CLEANUP_GRACE_SECONDS = 5.0
 CLEANUP_JOIN_SECONDS = 5.0
@@ -122,6 +125,18 @@ class Task:
     phase: Phase = "starting"
     observability: Literal["available", "unavailable"] = "unavailable"
     activity_seq: int = 0
+    waiting_for: Literal["model", "activity"] = "activity"
+    # Frozen text of fixed enums, numbers and bridge-generated time only. Kept
+    # separately from error so cleanup's abort_error cannot erase the cause.
+    timeout_diagnostics: str | None = None
+
+    @property
+    def inactivity_limit(self) -> float:
+        return (
+            MODEL_WAIT_TIMEOUT_SECONDS
+            if self.waiting_for == "model"
+            else INACTIVITY_TIMEOUT_SECONDS
+        )
 
     def accepted(self) -> dict[str, str]:
         return {"task_id": self.task_id, "session_id": self.session_id, "status": self.status}
@@ -131,6 +146,9 @@ class Task:
             elapsed_ms = max(0, int((time.monotonic() - self.run_started_monotonic) * 1000))
         else:
             elapsed_ms = self.elapsed_ms
+        error = self.error.as_dict() if self.error else None
+        if error is not None and self.timeout_diagnostics is not None:
+            error["message"] += self.timeout_diagnostics
         return {
             **self.accepted(),
             "started_at": self.started_at,
@@ -140,7 +158,7 @@ class Task:
             "observability": self.observability,
             "final_response": self.final_response.model_dump() if self.final_response else None,
             "finish_reason": self.finish_reason,
-            "error": self.error.as_dict() if self.error else None,
+            "error": error,
         }
 
 
@@ -232,7 +250,26 @@ class TaskManager:
         task.last_activity_monotonic = time.monotonic()
         task.last_activity_at = _utc_now()
         task.phase = cast(Phase, activity)
-        task.observability = "unavailable" if activity in UNOBSERVABLE_ACTIVITY else "available"
+        if activity == "step_start":
+            task.waiting_for = "model"
+        elif activity in {
+            "process_start",
+            "run_start",
+            "turn_start",
+            "turn_end",
+            "step_end",
+            "assistant_message",
+            "tool_call",
+            "tool_result",
+        }:
+            task.waiting_for = "activity"
+        # system/user messages may follow step/start before the model request.
+        # assistant/attempt settles a failed attempt; it is not a start signal.
+        task.observability = (
+            "unavailable"
+            if task.waiting_for == "model" or activity in UNOBSERVABLE_ACTIVITY
+            else "available"
+        )
 
     async def _notify_waiters(self) -> None:
         async with self._condition:
@@ -254,6 +291,8 @@ class TaskManager:
         task.final_response = None
         task.finish_reason = None
         task.error = None
+        task.waiting_for = "activity"
+        task.timeout_diagnostics = None
         task.worker = None
         task.watchdog = None
 
@@ -369,7 +408,7 @@ class TaskManager:
     def _deadline_remaining(task: Task, now: float) -> float:
         return min(
             task.run_started_monotonic + HARD_TIMEOUT_SECONDS - now,
-            task.last_activity_monotonic + INACTIVITY_TIMEOUT_SECONDS - now,
+            task.last_activity_monotonic + task.inactivity_limit - now,
         )
 
     async def _watch(self, task: Task) -> None:
@@ -411,8 +450,19 @@ class TaskManager:
                     return True
                 if self._apply_pending_activities():
                     self._condition.notify_all()
-                if self._deadline_remaining(task, time.monotonic()) > 0:
+                now = time.monotonic()
+                if self._deadline_remaining(task, now) > 0:
                     return False
+                hard = now >= task.run_started_monotonic + HARD_TIMEOUT_SECONDS
+                limit = HARD_TIMEOUT_SECONDS if hard else task.inactivity_limit
+                task.timeout_diagnostics = (
+                    f"; timeout={'hard' if hard else 'inactivity'}"
+                    f"; phase={task.phase}"
+                    f"; last_activity_at={task.last_activity_at}"
+                    f"; inactivity_seconds={max(0.0, now - task.last_activity_monotonic):.3f}"
+                    f"; deadline_seconds={limit:g}"
+                    f"; waiting_for={task.waiting_for}"
+                )
                 task.stopping = True
                 task.stop.set()
                 task.error = BridgeError("task_timeout_error")
