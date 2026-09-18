@@ -16,6 +16,7 @@ from deepseek_harness import DeepSeekHarness, Notification, RunResult
 from deepseek_harness.errors import JsonRpcError, SdkProtocolError, TransportClosedError
 from deepseek_harness_runtime import bundled_runtime_path
 
+from .execution import execution_patch
 from .macos_process import runtime_patch
 from .privacy import child_environment, prepare_state, privacy_patch
 from .protocol import BridgeError, ErrorClass
@@ -176,7 +177,9 @@ class Runtime:
                 state = prepare_state(self.workspace)
                 try:
                     compatibility = runtime_patch(state.runtime)
-                    patches = (str(patch),) + ((str(compatibility),) if compatibility else ())
+                    patches = (str(patch), str(execution_patch(state.runtime))) + (
+                        (str(compatibility),) if compatibility else ()
+                    )
                     self.harness = DeepSeekHarness(
                         dsh_home=str(state.home),
                         cwd=str(self.workspace),
