@@ -32,6 +32,34 @@ async def wait_terminal(manager, task_id, timeout_seconds):
             raise AssertionError(f"task stayed running until the deadline: {result}")
 
 
+def _message_text(message):
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                parts.append(str(block.get("text") or ""))
+        return "".join(parts)
+    return ""
+
+
+def _instruction_counts(request, instructions):
+    system_count = 0
+    user_count = 0
+    for message in request["messages"]:
+        role = message.get("role")
+        if role not in ("system", "user"):
+            continue
+        occurrences = _message_text(message).count(instructions)
+        if role == "system":
+            system_count += occurrences
+        else:
+            user_count += occurrences
+    return system_count, user_count
+
+
 @pytest.fixture
 def endpoint():
     captured = {
@@ -171,14 +199,27 @@ def test_real_wire_privacy_and_unpatched_difference(endpoint, wire_env, capfd, t
         assert KEY not in json.dumps(safe)
         assert endpoint["authorization"] == [True]
         assert "AGENTS.md" in json.dumps(safe["messages"])
+        continue_index = len(endpoint["requests"])
         second = runner.run(first.session_id, "CONTINUATION_CANARY", False, threading.Event())
         assert second.session_id == first.session_id
         assert runner.harness.client._proc is first_process
         assert "WIRE_CANARY" in json.dumps(endpoint["requests"][-1]["messages"])
+        new_index = len(endpoint["requests"])
         independent = runner.run("session-" + uuid.uuid4().hex, "NEW_TASK", True, threading.Event())
         assert independent.session_id != first.session_id
         assert runner.harness.client._proc is first_process
         assert "WIRE_CANARY" not in json.dumps(endpoint["requests"][-1]["messages"])
+        assert new_index > continue_index
+        instructions = bridge("protocol").COMMON_INSTRUCTIONS
+        for label, index in (
+            ("fresh", 0),
+            ("continue", continue_index),
+            ("new session", new_index),
+        ):
+            request = endpoint["requests"][index]
+            system_count, user_count = _instruction_counts(request, instructions)
+            assert system_count == 1, f"COMMON_INSTRUCTIONS must appear once in system: {label}"
+            assert user_count == 0, f"COMMON_INSTRUCTIONS must not appear in user: {label}"
     finally:
         runner.close()
     # No privacy patch. Deliberately opt in to BOTH plugins so the test proves
