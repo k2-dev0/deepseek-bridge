@@ -77,6 +77,7 @@ async def test_stdio_tools_and_invalid_inputs(repo, tmp_path, entrypoint):
             assert schema["additionalProperties"] is False
             assert not {"workspace", "model", "provider", "profile"} & schema["properties"].keys()
         wait_tool = next(tool for tool in listed if tool["name"] == "wait_task")
+        assert set(wait_tool["inputSchema"]["properties"]) == {"task_id"}
         output_schema = wait_tool.get("outputSchema")
         assert output_schema, "wait_task must publish the new snapshot output schema"
         properties = output_schema["properties"]
@@ -324,7 +325,7 @@ server.main()
             "tools/call",
             {
                 "name": "wait_task",
-                "arguments": {"task_id": task_id, "timeout_ms": 2000},
+                "arguments": {"task_id": task_id},
             },
         )
         snapshot = terminal["result"]["structuredContent"]
