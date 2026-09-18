@@ -241,3 +241,107 @@ server.main()
             process.kill()
             await process.wait()
         process.stdin.close()
+
+
+@pytest.mark.parametrize("exit_trigger", ["eof", "sigterm"])
+@pytest.mark.parametrize("stuck", ["close", "worker", "force_stop", "error_close"])
+async def test_cli_exits_with_unreleased_cleanup_threads(repo, exit_trigger, stuck):
+    # Keep the fault in place through interpreter exit. Releasing the threads in
+    # the child would hide asyncio.run()/ThreadPoolExecutor's implicit joins.
+    script = f"""
+import threading
+from deepseek_harness import RunResult
+from deepseek_bridge import tasks, server
+tasks.HARD_TIMEOUT_SECONDS = 0.1
+tasks.INACTIVITY_TIMEOUT_SECONDS = 60
+tasks.CLEANUP_GRACE_SECONDS = 0.05
+tasks.CLEANUP_JOIN_SECONDS = 0.05
+tasks.CLEANUP_FORCE_SECONDS = 0.05
+class Runtime:
+    def __init__(self, workspace):
+        self.done = threading.Event()
+    def run(self, session_id, message, fresh, stop, activity):
+        if {stuck!r} == 'error_close':
+            raise RuntimeError('cli-private-error-canary')
+        self.done.wait()
+        return RunResult(session_id, '{{}}', 'completed', [], [])
+    def owned_process(self):
+        return None
+    def close(self):
+        if {stuck!r} != 'worker':
+            threading.Event().wait()
+    def force_stop(self):
+        if {stuck!r} == 'force_stop':
+            threading.Event().wait()
+        self.done.set()
+        return True
+tasks.Runtime = Runtime
+server.main()
+"""
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        script,
+        cwd=server_cwd(repo),
+        env={**os.environ, "DEEPSEEK_API_KEY": "cli-cleanup-fixture-key"},
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    async def request(request_id, method, params):
+        process.stdin.write(
+            (
+                json.dumps({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
+                + "\n"
+            ).encode()
+        )
+        await process.stdin.drain()
+        return json.loads(await asyncio.wait_for(process.stdout.readline(), 3))
+
+    try:
+        await request(
+            1,
+            "initialize",
+            {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": "cleanup-fixture", "version": "1"},
+            },
+        )
+        process.stdin.write(b'{"jsonrpc":"2.0","method":"notifications/initialized"}\n')
+        started = await request(
+            2,
+            "tools/call",
+            {
+                "name": "start_task",
+                "arguments": {"brief": "Exercise bounded CLI shutdown"},
+            },
+        )
+        task_id = started["result"]["structuredContent"]["task_id"]
+        terminal = await request(
+            3,
+            "tools/call",
+            {
+                "name": "wait_task",
+                "arguments": {"task_id": task_id, "timeout_ms": 2000},
+            },
+        )
+        snapshot = terminal["result"]["structuredContent"]
+        assert snapshot["status"] == "failed"
+        assert snapshot["error"]["class"] == "abort_error"
+        if exit_trigger == "eof":
+            process.stdin.close()
+        else:
+            process.send_signal(signal.SIGTERM)
+        assert await asyncio.wait_for(process.wait(), 3) == 1
+        stderr = await process.stderr.read()
+        assert b"abort_error" in stderr
+        assert b"cli-private-error-canary" not in stderr
+        assert b"cli-cleanup-fixture-key" not in stderr
+        assert await process.stdout.read() == b""
+    finally:
+        if process.returncode is None:
+            process.kill()
+            await process.wait()
+        process.stdin.close()
