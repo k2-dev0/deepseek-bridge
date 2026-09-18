@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import threading
+import time
 
 import pytest
 from conftest import bridge, final
@@ -305,8 +306,89 @@ async def test_timeout_bounded_cleanup_failure_keeps_reservation(gate, repo, mon
             await manager.start("Must not overlap unreleased writer")
     finally:
         unblock_close.set()
+        # The stuck process eventually exits; the released close/worker are
+        # then reclaimed by the next bounded shutdown. The first recovery
+        # failure and held reservation stay asserted above.
+        process.alive = False
         manager.runtime.release.set()
         await manager.shutdown()
+    assert not any(t.name.startswith("deepseek-worker") for t in threading.enumerate())
+
+
+def _prepare_terminal_cleanup_failure(gate, repo, monkeypatch):
+    monkeypatch.setattr(gate, "CLEANUP_GRACE_SECONDS", 0.05)
+    monkeypatch.setattr(gate, "CLEANUP_JOIN_SECONDS", 0.1)
+    monkeypatch.setattr(gate, "EXECUTOR_JOIN_SECONDS", 0.5)
+    monkeypatch.setattr(gate, "HARD_TIMEOUT_SECONDS", 0.05, raising=False)
+    monkeypatch.setattr(gate, "INACTIVITY_TIMEOUT_SECONDS", 60.0, raising=False)
+    manager = gate.TaskManager(repo)
+    close_entered = threading.Event()
+    unblock_close = threading.Event()
+    original_close = manager.runtime.close
+
+    def blocked_close():
+        close_entered.set()
+        unblock_close.wait(5)
+        original_close()
+
+    monkeypatch.setattr(manager.runtime, "close", blocked_close)
+    return manager, close_entered, unblock_close
+
+
+async def _leave_terminal_cleanup_failure(gate, repo, monkeypatch):
+    manager, close_entered, unblock_close = _prepare_terminal_cleanup_failure(
+        gate, repo, monkeypatch
+    )
+    task = await manager.start("Work")
+    assert await asyncio.to_thread(manager.runtime.entered.wait, 2)
+    result = await manager.wait(task["task_id"], 3000)
+    assert result["status"] == "failed"
+    assert result["phase"] == "failed"
+    assert result["error"]["class"] == "abort_error"
+    assert close_entered.is_set()
+    assert manager._active is manager._tasks[task["task_id"]]
+    with pytest.raises(gate.BridgeError):
+        await manager.start("Must not overlap unreleased writer")
+    return manager, task, unblock_close
+
+
+async def test_shutdown_is_bounded_while_terminal_cleanup_stays_stuck(gate, repo, monkeypatch):
+    manager, task, unblock_close = await _leave_terminal_cleanup_failure(gate, repo, monkeypatch)
+    try:
+        started = time.monotonic()
+        with pytest.raises(gate.BridgeError, match="abort_error"):
+            await asyncio.wait_for(manager.shutdown(), 3)
+        assert time.monotonic() - started < 3
+        # A failed reclamation keeps the reservation, poison and executor.
+        assert manager._active is manager._tasks[task["task_id"]]
+        assert manager._executor is not None
+        terminal = await manager.wait(task["task_id"], 0)
+        assert terminal["status"] == "failed"
+        assert terminal["error"]["class"] == "abort_error"
+    finally:
+        unblock_close.set()
+        manager.runtime.release.set()
+        await asyncio.wait_for(manager.shutdown(), 3)
+    assert not any(t.name.startswith("deepseek-worker") for t in threading.enumerate())
+
+
+async def test_shutdown_reclaims_terminal_cleanup_after_release(gate, repo, monkeypatch):
+    manager, task, unblock_close = await _leave_terminal_cleanup_failure(gate, repo, monkeypatch)
+    with pytest.raises(gate.BridgeError, match="abort_error"):
+        await asyncio.wait_for(manager.shutdown(), 3)
+    assert manager._active is manager._tasks[task["task_id"]]
+    unblock_close.set()
+    manager.runtime.release.set()
+    await asyncio.wait_for(manager.shutdown(), 3)
+    # Only a successful re-recovery publishes reclamation; the task stays failed.
+    assert manager._active is None
+    assert manager._executor is None
+    assert manager._pending_close == set()
+    terminal = await manager.wait(task["task_id"], 0)
+    assert terminal["status"] == "failed"
+    assert terminal["error"]["class"] == "abort_error"
+    # The stuck close task was reused, so only one close ran to completion.
+    assert manager.runtime.closed == 1
     assert not any(t.name.startswith("deepseek-worker") for t in threading.enumerate())
 
 
