@@ -9,6 +9,7 @@ import threading
 from collections.abc import Callable
 from contextlib import suppress
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlsplit
 
 from deepseek_harness import DeepSeekHarness, Notification, RunResult
@@ -22,6 +23,9 @@ from .protocol import COMMON_INSTRUCTIONS, BridgeError, ErrorClass
 SDK_VERSION = "0.1.5rc1"
 MODEL = "deepseek-flash"
 PROFILE = "sdk-minimal"
+# Bounded force-stop values for the captured owned process only.
+FORCE_TERMINATE_SECONDS = 2.0
+FORCE_KILL_SECONDS = 2.0
 
 # Only fixed activity tokens cross from the SDK callback into TaskManager.
 # Event bodies, tool arguments, messages and exception text never leave this module.
@@ -136,6 +140,12 @@ def classify_model_failure(detail: str) -> ErrorClass:
     return "model_error"
 
 
+def _wait_owned_process(process: Any, timeout: float) -> bool:
+    with suppress(subprocess.TimeoutExpired, OSError):
+        process.wait(timeout=timeout)
+    return process.poll() is not None
+
+
 class Runtime:
     def __init__(self, workspace: Path):
         self.workspace = workspace
@@ -214,6 +224,29 @@ class Runtime:
             detail = json.dumps(endings[-1].get("data")) if endings else ""
             raise BridgeError(classify_model_failure(detail))
         return result
+
+    def owned_process(self) -> Any:
+        """Captured owned Popen. Never waits on the lifecycle lock."""
+        harness = self.harness
+        return harness.client._proc if harness is not None else None
+
+    def force_stop(self) -> bool:
+        """Bound the captured owned process after a stuck graceful close.
+
+        Only this instance's captured Popen is polled/terminated/waited/killed.
+        No other process is searched for or killed, and no process output or
+        exception text crosses this boundary.
+        """
+        process = self.owned_process()
+        if process is None or process.poll() is not None:
+            return True
+        with suppress(OSError):
+            process.terminate()
+        if _wait_owned_process(process, FORCE_TERMINATE_SECONDS):
+            return True
+        with suppress(OSError):
+            process.kill()
+        return _wait_owned_process(process, FORCE_KILL_SECONDS)
 
     def close(self) -> None:
         with self._lifecycle:
