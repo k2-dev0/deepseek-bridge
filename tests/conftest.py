@@ -69,6 +69,12 @@ def gate(monkeypatch):
                 raise self.failure
             return RunResult(session_id, self.response, "completed", [], [])
 
+        def owned_process(self):
+            return None
+
+        def force_stop(self):
+            return True
+
         def close(self):
             self.closed += 1
             self.release.set()
