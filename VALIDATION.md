@@ -230,3 +230,40 @@ heredoc一般・長さ・単純な先行操作だけを原因とはできず、G
 
 診断scriptと合成結果は管理外の`.codex/e2e/artifacts/`に保存した。
 通常テスト・型検査・lintの前回結果は更新していない。今回はアプリ変更なしの原因調査であり、新たな修正完了や全件解決とは扱わない。
+
+### 停止条件の再現と実行環境の修正（2026-09-18、後続調査）
+
+前節までの「heredoc未再現」は以下の追加実験により更新された。
+元2件の引用heredoc本文を、そのまま一時workspaceのファイルへ書く条件で再現した。
+通常のSDK shellでは双方とも入力投入後にbashだけが残り、file未作成・tool/resultなしで5秒の検証期限に到達。
+同じshellで先に`set +H`だけを実行すると双方ともcompleted、1135/1162 bytesのfile、後続marker、tool/resultを取得した（4.287/4.076秒、回収込み）。
+書込みに感嘆符が含まれ、対話bashの履歴展開とSDKのコマンド引用の組合せが停止条件だった。
+元プロセスの事後鑑識ではなく、元本文で原因条件とその除去を対照再現した証拠である。
+単一行Python書込みでも同様に履歴展開の無効化で返却が回復した。ただしその生成Python自体にはSyntaxErrorがあり、正常なファイル作成とは区別した。
+
+短い読み取り停止も別に再現した。220文字のstrings/grep/headコマンドは30行でも4648061 bytes、最大一行3780301 bytesを出力する。
+通常shellのpipeでは2.053秒で終了したが、実SDKのPTYでは5秒期限時点まで子pipelineが残った。
+入力投入は完了済み。出力だけを破棄した対照、各行200文字へ制限した対照は、それぞれcompletedとなった。
+これはPythonの計算速度・入力文字数の問題ではなくPTYへ渡す巨大出力に依存する経路。今回任意出力の自動切捨ては実装していない。
+
+修正内容はexecution.py/mjsとRuntimeへの組込み。
+- 所有bashを`--noprofile --norc -i +H`で起動し、最初のモデルコマンドから履歴展開を無効にする。
+- SDKが除去するGIT_CONFIG_KEY_nのうち、有効COUNT範囲の正確な親変数だけを明示envへ復元。明示override/tombstoneは保持する。
+- 私有PATHのGit入口で`--no-pager`を既定化。元argvを保持し、後続の明示`--paginate`を尊重する。
+- 親環境、SDK binary、配布設定、通常timeout、Gitの保護設定は変更しない。
+
+修正前の実SDK回帰はheredoc/Pythonの両方が期限切れ。修正後は両方成功。
+既存Git Red2件も成功し、7組すべての実効値一致と無関係な秘密の不在を確認。
+明示pagerの入力不要対照も成功。引数保持、環境override、COUNT境界、symlink拒否の非wire検証も成功。
+全体を保護付き外部runnerで実行した結果は117 passed、1 failed、1 skipped。
+failedはworkspace-binding用fixtureのGit初期化を保護が拒否し.gitが存在しなかったため。通常runnerで当該1件を再実行するとpassed。
+skippedはegress境界の検証で、今回の直接wire実行を全通信境界の再検証成功とは数えない。
+型検査・lint・書式検査は成功。
+
+新規の実MCPをdeepseek-launch.sh経由で起動した受入実験では、ローカル合成モデルから、感嘆符入りfile作成→Python編集とassert→Git status→PATH/HOMEのみenv-iのdelta設定付きGit logを実行。
+completed、tool完了marker、編集済みfile、MCP exit 0を確認。一時HOME/state/workfileを終了時に回収した。
+モデルは合成fixtureであり、実サービスの推論品質の評価ではない。自動PostToolUse配送は既存の別実測を参照し、この直接MCP実験では主張しない。
+起動済みMCPには自動で反映されないため、利用元でMCPサーバーの再起動が必要。
+
+検証中、補助Nodeテストの環境比較失敗が親環境をエラー表示する事故があった。値は本書へ記載しない。
+テストは固定合成環境のみを渡すよう修正し成功。出力済み記録の消去・キー失効は実施しておらず、露出したAPI credentialの交換が必要。
