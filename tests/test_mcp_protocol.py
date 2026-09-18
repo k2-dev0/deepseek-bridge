@@ -105,6 +105,26 @@ async def test_stdio_tools_and_invalid_inputs(repo, tmp_path, entrypoint):
             "observability",
         } <= required
         assert properties["observability"].get("enum") == ["available", "unavailable"]
+        assert {
+            "starting",
+            "process_start",
+            "run_start",
+            "turn_start",
+            "turn_end",
+            "step_start",
+            "step_end",
+            "tool_call",
+            "tool_result",
+            "model_attempt",
+            "assistant_message",
+            "user_message",
+            "system_message",
+            "completed",
+            "needs_decision",
+            "failed",
+            "aborted",
+            "interrupted",
+        } <= set(properties["phase"].get("enum", []))
         for index, arguments in enumerate(
             (
                 {"brief": " "},
