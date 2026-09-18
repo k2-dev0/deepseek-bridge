@@ -284,11 +284,10 @@ class TaskManager:
             raise BridgeError("configuration_error") from None
         async with self._condition:
             task = self._lookup(task_id)
-            sequence = task.activity_seq
             if task.status == "running" and timeout_ms:
                 try:
                     await asyncio.wait_for(
-                        self._condition.wait_for(self._wait_predicate(task, sequence)),
+                        self._condition.wait_for(self._terminal_predicate(task)),
                         timeout_ms / 1000,
                     )
                 except TimeoutError:
@@ -357,6 +356,10 @@ class TaskManager:
     @staticmethod
     def _wait_predicate(task: Task, sequence: int) -> Callable[[], bool]:
         return lambda: task.status != "running" or task.activity_seq != sequence
+
+    @staticmethod
+    def _terminal_predicate(task: Task) -> Callable[[], bool]:
+        return lambda: task.status != "running"
 
     @staticmethod
     def _deadline_remaining(task: Task, now: float) -> float:
