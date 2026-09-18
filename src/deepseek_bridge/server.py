@@ -35,8 +35,8 @@ INPUTS: dict[str, type[StartInput] | type[WaitInput] | type[ContinueInput] | typ
 DESCRIPTIONS = {
     "start_task": "Start one background task in the bound repository (brief <= 32000 characters).",
     "wait_task": (
-        "Wait until terminal status or timeout for 0..60000 ms; "
-        "a timeout returns the current snapshot and leaves the task running."
+        "Wait until terminal status and return one final snapshot; "
+        "SDK activity does not produce progress results."
     ),
     "continue_task": (
         "Continue a completed or needs_decision task in the same Harness session. "
@@ -85,7 +85,7 @@ async def serve() -> None:
             if isinstance(value, StartInput):
                 result = await manager.start(value.brief, value.title)
             elif isinstance(value, WaitInput):
-                result = await manager.wait(value.task_id, value.timeout_ms)
+                result = await manager.wait(value.task_id)
             elif isinstance(value, ContinueInput):
                 result = await manager.continue_task(value.task_id, value.message)
             else:
