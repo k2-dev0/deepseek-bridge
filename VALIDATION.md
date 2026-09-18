@@ -1,5 +1,18 @@
 # 検証記録
 
+## 2026-09-18 — Git回帰テストと実装workerの停止
+
+開始時HEADは`bdac4f1`。Git設定欠落とPTY pager待ちを検出する回帰テストだけを`d96664c`で追加した。production修正は未実施。以下を修正完了・Greenの証拠にはしない。
+
+- `.venv/bin/python -m pytest tests/test_privacy_wire.py -k git_execution -q --tb=short`は実SDK・loopback fixtureで **2 failed, 10 deselected（36.28秒）**。Git環境はCOUNT=7 / KEY=0 / VALUE=7で、実Gitはmissing config key。PATH/HOMEだけを残す`env -i`と実PTY、`core.pager=delta`のstatus/logは検証専用30秒期限で停止した。
+- 固定出力には`--format=format:fixture`を使用する。`--format=fixture`はこのGitで不正な指定であり、pager起動前の終了を成功に誤認するため使用しない。
+- 対象テストの構文・Ruff lint/format確認は成功。Redには7組の実効値一致とAPIキー不在の追加確認、明示paginate対照がまだ必要。Green・最終利用経路の検証・独立レビューは未実施。
+- Red完了workerは`task-21be1434b0734860bd4c4e9bece3bfad` / `session-7e689c2d70d841599b499ed7c0ee04c8`。同sessionのGreenは、最初の書込み呼出し（単一行2,774文字、heredocなし、静的bash構文検査0）でtool/call後120秒無活動となった。production差分は残っていない。
+- 次のfresh worker `task-5819b1c937924cbc8a5b460478d208be` / `session-1cda32d324874010a7bd095cc0569efa`もtool/call後120秒で停止した。最後は220文字・1行の、runtime binaryに対するstrings/grep/headの読取りパイプラインで、書込みではない。静的bash構文検査は0。短い入力や書込み方法の変更で安定するという証拠にはならない。
+- 両失敗ともerrorに`timeout=inactivity; phase=tool_call; deadline_seconds=120; waiting_for=activity`が返った。旧bridgeでの報告生成120秒停止とは区別する。terminal結果後に保護状態の`busy=false`と親の読取りを確認し、手動解除していない。
+
+停止時の所有子プロセス・stdin投入・コマンド完了マーカーは採取していない。未開始、実行中、完了通知待ちのどこで止まったかは未確定であり、長さ・heredoc・MCP・Harnessのいずれかを原因と断定しない。元heredoc3件も未解決。同じ停止へのfresh task再投入をここで終了した。秘密や入力・応答本文はこの記録へ保存していない。
+
 ## 2026-09-18 — 現在の保護環境での再検証
 
 復旧後のwire実行時HEADは`bbc6958ca160d56ddc6e9efb93a846b36e459286`。macOS arm64、bridge 0.1.1、SDK/runtime 0.1.5rc1。既存のmacOS互換処理は変更していない。
