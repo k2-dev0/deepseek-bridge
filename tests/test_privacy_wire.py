@@ -489,3 +489,35 @@ async def test_git_execution_pager_bypass_without_terminal_environment(
     finally:
         await manager.shutdown()
     assert not any(t.name.startswith("deepseek-worker") for t in threading.enumerate())
+
+
+@pytest.mark.parametrize("form", ["heredoc", "python"])
+async def test_execution_shell_preserves_literal_exclamation(
+    endpoint, wire_env, monkeypatch, form
+):
+    tasks = bridge("tasks")
+    monkeypatch.setattr(tasks, "INACTIVITY_TIMEOUT_SECONDS", 5)
+    monkeypatch.setattr(tasks, "HARD_TIMEOUT_SECONDS", 20)
+    endpoint["mode"] = "tool"
+    expected = "if (!ready) { return false; }\n"
+    if form == "heredoc":
+        command = "cat > literal.txt <<'EOF'\n" + expected + "EOF\n"
+    else:
+        import shlex
+
+        code = "from pathlib import Path; Path('literal.txt').write_text(" + repr(expected) + ")"
+        command = shlex.quote(sys.executable) + " -c " + shlex.quote(code) + "; "
+    endpoint["command"] = command + "printf EXECUTION_DONE"
+    manager = tasks.TaskManager(wire_env)
+    try:
+        accepted = await manager.start("Execute the literal-writing fixture")
+        result = await wait_terminal(manager, accepted["task_id"], 15)
+        assert result["status"] == "completed", result["error"]
+        assert (wire_env / "literal.txt").read_text() == expected
+        messages = endpoint["requests"][-1]["messages"]
+        assert any(
+            m.get("role") == "tool" and "EXECUTION_DONE" in json.dumps(m) for m in messages
+        )
+    finally:
+        await manager.shutdown()
+    assert not any(t.name.startswith("deepseek-worker") for t in threading.enumerate())
