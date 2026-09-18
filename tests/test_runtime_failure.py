@@ -215,6 +215,101 @@ async def test_timeout_cleanup_failure_keeps_reservation(gate, repo, monkeypatch
     assert not any(t.name.startswith("deepseek-worker") for t in threading.enumerate())
 
 
+class _FakeProcess:
+    def __init__(self):
+        self.alive = True
+
+    def poll(self):
+        return None if self.alive else 0
+
+
+def _prepare_timeout_recovery(gate, repo, monkeypatch, mode):
+    monkeypatch.setattr(gate, "CLEANUP_GRACE_SECONDS", 0.05)
+    monkeypatch.setattr(gate, "CLEANUP_JOIN_SECONDS", 0.1)
+    monkeypatch.setattr(gate, "EXECUTOR_JOIN_SECONDS", 0.5)
+    monkeypatch.setattr(gate, "HARD_TIMEOUT_SECONDS", 0.05, raising=False)
+    monkeypatch.setattr(gate, "INACTIVITY_TIMEOUT_SECONDS", 60.0, raising=False)
+    manager = gate.TaskManager(repo)
+    process = _FakeProcess()
+    close_entered = threading.Event()
+    unblock_close = threading.Event()
+    force_calls = []
+    original_close = manager.runtime.close
+
+    def blocked_close():
+        close_entered.set()
+        unblock_close.wait(5)
+        if mode != "worker_stuck":
+            original_close()
+
+    def fake_owned_process():
+        return process
+
+    def fake_force_stop():
+        force_calls.append(mode)
+        if mode == "force_stop_failed":
+            return False
+        if mode == "close_join_failed":
+            # Force stop succeeds, but the close task stays blocked past its join.
+            return True
+        if mode == "process_still_alive":
+            unblock_close.set()
+            return True
+        process.alive = False
+        unblock_close.set()
+        return True
+
+    monkeypatch.setattr(manager.runtime, "owned_process", fake_owned_process)
+    monkeypatch.setattr(manager.runtime, "force_stop", fake_force_stop)
+    monkeypatch.setattr(manager.runtime, "close", blocked_close)
+    return manager, process, close_entered, unblock_close, force_calls
+
+
+async def test_timeout_force_stop_unblocks_stuck_close(gate, repo, monkeypatch):
+    manager, process, close_entered, unblock_close, force_calls = _prepare_timeout_recovery(
+        gate, repo, monkeypatch, "success"
+    )
+    task = await manager.start("Work")
+    assert await asyncio.to_thread(manager.runtime.entered.wait, 2)
+    result = await manager.wait(task["task_id"], 3000)
+    assert close_entered.is_set()
+    assert force_calls == ["success"]
+    assert process.alive is False
+    assert result["status"] == "failed"
+    assert result["phase"] == "failed"
+    assert result["error"]["class"] == "task_timeout_error"
+    fresh = await manager.start("Fresh work after forced cleanup")
+    assert fresh["session_id"] != task["session_id"]
+    await manager.shutdown()
+    assert not any(t.name.startswith("deepseek-worker") for t in threading.enumerate())
+
+
+@pytest.mark.parametrize(
+    "mode",
+    ["force_stop_failed", "close_join_failed", "process_still_alive", "worker_stuck"],
+)
+async def test_timeout_bounded_cleanup_failure_keeps_reservation(gate, repo, monkeypatch, mode):
+    manager, process, close_entered, unblock_close, force_calls = _prepare_timeout_recovery(
+        gate, repo, monkeypatch, mode
+    )
+    task = await manager.start("Work")
+    assert await asyncio.to_thread(manager.runtime.entered.wait, 2)
+    try:
+        result = await manager.wait(task["task_id"], 3000)
+        assert close_entered.is_set()
+        assert force_calls == [mode]
+        assert result["status"] == "failed"
+        assert result["phase"] == "failed"
+        assert result["error"]["class"] == "abort_error"
+        with pytest.raises(gate.BridgeError):
+            await manager.start("Must not overlap unreleased writer")
+    finally:
+        unblock_close.set()
+        manager.runtime.release.set()
+        await manager.shutdown()
+    assert not any(t.name.startswith("deepseek-worker") for t in threading.enumerate())
+
+
 async def test_timeout_shutdown_cleanup_is_serialized(gate, repo, monkeypatch):
     monkeypatch.setattr(gate, "HARD_TIMEOUT_SECONDS", 0.2, raising=False)
     monkeypatch.setattr(gate, "INACTIVITY_TIMEOUT_SECONDS", 60.0, raising=False)
