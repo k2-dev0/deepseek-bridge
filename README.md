@@ -96,7 +96,7 @@ failed / aborted / interrupted        （終端）
 `wait_task`は`task_id/session_id/status/started_at/last_activity_at/elapsed_ms/phase/observability/final_response/finish_reason/error`を返す。
 `started_at`/`last_activity_at`はUTC aware date-time、`elapsed_ms`は単調時計の非負整数。terminal後は`elapsed_ms`をfrozenする。
 `phase`は固定Literal語彙（`starting`/`process_start`/`run_start`/`turn_start`/`turn_end`/`step_start`/`step_end`/`tool_call`/`tool_result`/`model_attempt`/`assistant_message`/`user_message`/`system_message`とterminal status）。`observability`は`available`/`unavailable`。
-SDK `on_notification`の実eventだけで`last_activity_at`とphaseを更新し、`starting`/`process_start`/`run_start`/`step_start`/`tool_call`/`model_attempt`は次eventまで内部進捗を観測できないため`unavailable`、他の離散eventは`available`とする。
+SDK `on_notification`の実eventだけで`last_activity_at`とphaseを更新する。モデル待ち中、および`starting`/`process_start`/`run_start`/`step_start`/`tool_call`/`model_attempt`は次eventまで内部進捗を観測できないため`unavailable`、他の離散eventは`available`とする。
 terminal遷移は実処理終了・cleanup完了の事実として`last_activity_at`/activity sequence/phaseをterminal statusへ進め、`observability`を`available`にする。wait/pollはactivity時刻を更新しない。
 event本文・tool引数・model出力・例外本文・secretはsnapshotへ出さず、worker threadからqueueされた最終activityもterminal公開前に処理する。
 `final_response`は次節の検証済みobjectまたはnull。`error`は短い`class/message`またはnull。
@@ -110,13 +110,17 @@ failed taskの暗黙resumeはなく、runtime crash・abort後のfresh taskで�
 SDK protocolにcancel RPCがないため、abortは所有するruntimeの`close()`でshutdown、必要ならterminate/kill/waitを行う。
 初期化と終了を直列化し、初期化中の取消でmodel turnを始めない。初期化中のabortはSDKの30秒の初期化期限まで待つ場合がある。
 終了失敗は`abort_error`とし、新しいwriterを受け付けない。worktreeをGit reset/restore等で戻す処理はない。
-task全体のhard timeoutは既定20分、最終activityからのinactivity timeoutは既定120秒とし、通常の47秒stepをinactivityで打ち切らない。
+task全体のhard timeoutは20分。最終activityからのinactivity timeoutはモデル待ち中600秒、その他（起動・ツール実行等）は120秒。hardとinactivityが両方期限超過ならhardを診断理由にする。
+固定SDK 0.1.5rc1のRPCは`session.event`/`session.status`/subagent通知を公開するが、内部の`agent/assistant-stream`は転送しない。`assistant/attempt`は失敗・中断した応答の確定イベントであり、推論開始や途中deltaではない。架空のheartbeatでactivityを更新しない。
+`step/start`からモデル待ちを保持し、その後のsystem/user messageや失敗attemptでも維持する。assistant message・tool call/result・step/turn終了で通常の期限へ戻す。モデル準備もこの観測区間に含まれ、無応答と正常な長い推論を完全には区別できないため、600秒の有限期限と20分の全体上限を併用する。
 watchdogは単純sleepではなくconditionでactivity sequence/status変化を待ち、deadline到達後もcondition lock下で最新`last_activity_monotonic`とhard deadlineを再評価してからtimeout回収へ進む。
 timeout/abort/shutdownの回収はgraceful `close()`を固定猶予だけ待ち、猶予超過時はclose taskをcancelせず、所有Harness process（`harness.client._proc`）だけをterminate→有限wait→kill→有限waitで強制停止してpipe/writeを解除し、close taskとrun workerを固定猶予でjoinする。他processの検索・killやprocess出力・例外本文の公開はしない。
 run/close/force stopはbridgeが所有するdaemon threadで実行し、graceful close・force stop・close join・run joinをそれぞれ最大5秒待つ。成功には実threadの終了とjoinを要求する。停止したcallをdefault executorへ投入しないため、回収失敗後にPython終了処理が同じthreadを無期限joinし直すことはない。
 force stop失敗、close/worker未終了、process poll残存は`failed`+`abort_error`として予約を保持する。daemon指定を回収成功とはみなさず、CLI終了時も`abort_error`を報告する。所有processを停止できなかった場合はhost側で残processを確認する。
 timeout時は所有runtimeのcloseとrun/thread回収を行い、成功時は`failed`+`task_timeout_error`で予約を解放しfresh taskを開始できる。
 cleanup失敗時は`failed`+`abort_error`として予約を保持し、fresh taskを拒否する。timeout・abort・shutdownの回収は`_cleanup` lockで直列化する。
+timeout判定時に停止直前の診断を固定し、`error.message`の静的説明へ`; timeout=hard|inactivity; phase=...; last_activity_at=...; inactivity_seconds=...; deadline_seconds=...; waiting_for=model|activity`を付加する。phase/時刻は終了遷移前、秒数は判定時点の値であり回収時間を含まない。回収失敗で`abort_error`になっても保持し、遅延通知や再snapshotで上書きしない。固定enum・bridge生成時刻・数値だけを含め、本文・引数・例外を含めない。
+既存の出力キー・phase列挙・errorの`class/message`構造は変更しない。top-levelのterminal phase/last_activity_atの意味も維持する。従来の厳密なWaitOutput schemaで検証可能だが、error.messageの完全一致に依存するconsumerは更新が必要。分類にはerror.classを使う。新しい実行では待ち区分と診断をresetする。実装変更の反映には利用元のbridge processの再起動が必要。
 shutdownはrunning taskに加え、`failed`+`abort_error`で予約を保持したterminal task、未完了のclose/force stop、idleなruntimeも同じ固定期限の回収経路で扱う。未回収callのhandleを保持して再利用し、停止中のclose/force stopを重複起動しない。
 再回収の成功時だけ`_active`/run thread/runtimeを回収済みにしてtaskは`failed`+`abort_error`のまま保持し、再回収の失敗時は固定時間内に`abort_error`を返して予約/poison状態を保持する。
 `continue_task`は同じsessionを維持し、runごとのstarted/last_activity/elapsed/deadline/stop状態をresetする。
