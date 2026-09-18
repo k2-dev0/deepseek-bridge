@@ -16,6 +16,16 @@ bridgeの責務はworkspace固定、session継続、単一writer、待機・取�
 Gitのstage/commit、branch/worktree作成、難度評価、model routing、review、deploy、OpenCodeや別modelへのfallbackは実装しない。
 Gitを使うのは起動時の読み取り専用root解決だけ。
 
+### Harnessの実行環境補正
+
+固定SDK 0.1.5rc1のpersistent bashはPTY用の対話モードを使う。bridgeは起動引数に`+H`を指定し、モデルが送る`!`入りのソースコードをbashの履歴展開に解釈させない。heredocだけでなくPython等へ渡す文字列にも適用する。親のshell設定やSDK binaryは変更しない。
+
+同SDKの秘密名除去は`GIT_CONFIG_KEY_n`も落とすため、実行専用pluginが有効なCOUNT範囲にある正確な名前だけを明示環境へ復元する。無関係なKEY/SECRET等は復元せず、COUNT/VALUEや不完全な設定組を削除してエラーを隠さない。明示環境の上書き・削除指定を保持する。
+
+子のPATHには私有のGit入口を追加し、実Gitへ`--no-pager`と元の引数を渡す。PATHを保持する`env -i`でも入力待ちを避け、後続の明示`--paginate`は尊重する。Git設定値・秘密は生成fileに書かない。絶対pathでGitを直接指定する場合やPATHを置き換える場合はこの入口を通らないため、呼出し側で非対話設定が必要。
+
+大量出力をPTYへ流す検索は別の負荷になる。`head`の行数だけでは巨大な一行を制限できない。binary検索は対象範囲と出力bytes/行長も制限する。今回の補正は任意の巨大出力を自動で切り捨てるものではない。
+
 ## 導入
 
 Python 3.12以上、Git、uvが必要。検証環境はPython 3.12.8 / uv 0.5.9。
