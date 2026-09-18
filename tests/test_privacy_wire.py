@@ -8,6 +8,7 @@ import os
 import socket
 import sys
 import threading
+import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -17,6 +18,18 @@ from deepseek_harness import DeepSeekHarness
 
 pytestmark = pytest.mark.wire
 KEY = "wire-only-canary-" + "a" * 24
+
+
+async def wait_terminal(manager, task_id, timeout_seconds):
+    """Return the first terminal snapshot; running activity is intermediate."""
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
+        result = await manager.wait(task_id, min(remaining_ms, 60000))
+        if result["status"] != "running":
+            return result
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"task stayed running until the deadline: {result}")
 
 
 @pytest.fixture
@@ -274,7 +287,7 @@ async def test_real_api_errors(endpoint, wire_env, mode, category):
     manager = bridge("tasks").TaskManager(wire_env)
     try:
         task = await manager.start("Exercise failure classification")
-        result = await manager.wait(task["task_id"], 15000)
+        result = await wait_terminal(manager, task["task_id"], 15.0)
         assert result["status"] == "failed", result
         assert result["error"]["class"] == category, result
         assert KEY not in str(result)
@@ -296,7 +309,8 @@ async def test_real_abort_runtime_recreation_and_crash(endpoint, wire_env):
         endpoint["mode"] = "ok"
         endpoint["arrived"].clear()
         fresh = await manager.start("Fresh runtime")
-        assert (await manager.wait(fresh["task_id"], 15000))["status"] == "completed"
+        fresh_result = await wait_terminal(manager, fresh["task_id"], 15.0)
+        assert fresh_result["status"] == "completed"
         process2 = manager.runtime.harness.client._proc
         assert process2.pid != process.pid
         endpoint["mode"] = "hang"
@@ -304,7 +318,7 @@ async def test_real_abort_runtime_recreation_and_crash(endpoint, wire_env):
         crash = await manager.start("Runtime crash")
         assert await asyncio.to_thread(endpoint["arrived"].wait, 10)
         process2.kill()
-        failed = await manager.wait(crash["task_id"], 15000)
+        failed = await wait_terminal(manager, crash["task_id"], 15.0)
         assert failed["status"] == "failed"
         assert failed["error"]["class"] == "harness_protocol_error"
         assert process2.poll() is not None
