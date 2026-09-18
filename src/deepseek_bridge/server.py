@@ -38,7 +38,12 @@ DESCRIPTIONS = {
         "Wait on task status or new SDK activity for 0..60000 ms; "
         "a timeout leaves the task running."
     ),
-    "continue_task": "Continue a completed or needs_decision task in the same Harness session.",
+    "continue_task": (
+        "Continue a completed or needs_decision task in the same Harness session. "
+        "Pass only new information or a diff; do not repeat the initial brief or "
+        "confirmed requirements. Explicit corrections or additions are forwarded "
+        "as-is; the bridge never summarizes or deletes message text."
+    ),
     "abort_task": "Stop the active task and reclaim its runtime; preserve worktree changes.",
 }
 
