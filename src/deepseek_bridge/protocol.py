@@ -112,7 +112,6 @@ class StartInput(StrictModel):
 
 class WaitInput(StrictModel):
     task_id: TaskID
-    timeout_ms: Annotated[int, Field(ge=0, le=60000)] = 60000
 
 
 class ContinueInput(StrictModel):
