@@ -158,7 +158,7 @@ def test_cli_normal_files_are_private(tmp_path, monkeypatch):
         logging.disable(previous_logging)
 
 
-async def test_sdk_event_wakes_wait_and_updates_activity_without_payload_leak(sdk_gate, repo):
+async def test_sdk_event_updates_activity_without_waking_wait(sdk_gate, repo):
     manager = bridge("tasks").TaskManager(repo)
     try:
         task = await manager.start("Inspect the repository")
@@ -168,17 +168,19 @@ async def test_sdk_event_wakes_wait_and_updates_activity_without_payload_leak(sd
         waiter = asyncio.create_task(manager.wait(task["task_id"], 5000))
         await asyncio.sleep(1.1)
         sdk_gate.notify("turn/start", canary="sdk-notification-canary-9f3")
-        woken = await asyncio.wait_for(waiter, 2)
-        assert woken["status"] == "running"
-        assert woken["observability"] in {"available", "unavailable"}
-        assert isinstance(woken["phase"], str) and woken["phase"]
-        assert woken["last_activity_at"] is not None
-        assert woken["last_activity_at"] > before["last_activity_at"]
-        assert "progress" not in woken
+        await asyncio.sleep(0.05)
+        assert not waiter.done(), "SDK activity must not wake the public long-poll"
+        observed = await manager.wait(task["task_id"], 0)
+        assert observed["status"] == "running"
+        assert observed["observability"] in {"available", "unavailable"}
+        assert isinstance(observed["phase"], str) and observed["phase"]
+        assert observed["last_activity_at"] is not None
+        assert observed["last_activity_at"] > before["last_activity_at"]
+        assert "progress" not in observed
         assert "sdk-notification-canary-9f3" not in json.dumps(before)
-        assert "sdk-notification-canary-9f3" not in json.dumps(woken)
+        assert "sdk-notification-canary-9f3" not in json.dumps(observed)
         sdk_gate.release.set()
-        completed = await manager.wait(task["task_id"], 2000)
+        completed = await asyncio.wait_for(waiter, 2)
         assert completed["status"] == "completed"
         assert completed["phase"] == "completed"
         assert completed["observability"] == "available"
