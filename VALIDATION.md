@@ -126,3 +126,32 @@ sh tests/linux_wire.sh
 この開発環境の外部実行はREADMEの`outside.sh`経由commandを用いた。
 当時の記録にある`.codex/hooks/shell/protected-exec.py`の変更は、uv一時cacheのmarker 1個への例外と、wire検証commandへのloopback制限。2026-09-18の復旧前にはどちらも存在せず、今回復旧したのはwire検証commandの制限だけ。
 `.codex/`は既存方針どおり管理外で、アプリの配布物には含めない。
+
+## bash停滞の追加切り分け（2026-09-18）
+
+調査対象は、tool/call後にtool/resultが返らなかった既存実行。モデル待ちの120秒中断とは別に扱う。
+検証taskは`task-3f74d7aa084a4a6a9bd0c4ad55eb0770`、sessionは`session-0f76197684634bf594c54dbb85fbc5eb`。
+既存のlocal SSE fixtureから実bridge/DSHへ合成コマンドを渡し、通常`/bin/bash -c`と比較した。
+各caseは別TaskManager/session・一時workspace/stateで、検証プロセス内だけhard=8秒、通常/model無活動=5秒。
+外側のworker経路から実行し、通常設定・追跡file・配布元の保護ルールは変更していない。
+
+| case | 条件 | DSH結果 | elapsed_ms | 通常shell終了code | file bytes |
+|---|---|---|---:|---:|---:|
+| A | 小さいheredocでファイル作成 | completed | 1060 | 0 | 6 |
+| B | ASCII 500行・20000 bytesのheredoc | completed | 1046 | 0 | 20000 |
+| C | 1行Pythonで同量ファイル作成 | completed | 1055 | 0 | 20000 |
+| D | env -iでPATH/HOMEだけ残してgit --version | completed | 1203 | 0 | 対象外 |
+
+4ケースとも通常shellの出力との一致、モデルへのtool結果の返却、case終了後のdeepseek-worker thread残数0を記録した。検証全体は14884ms、起動用コマンド終了codeは0。
+Aの検証scriptは期待長を誤って5としたためfile_ok=falseだったが、合成本文は5文字+改行で正しく6 bytes。これは診断用assertionの誤りとして扱い、無条件の全assertion成功とはしない。
+実行scriptの終了処理にはmanager.shutdown、endpoint終了、一時workspace/stateのcleanupがある。OS全プロセスの残存検査はこの実験では行っていない。
+
+workerの最終報告は得られていない。実験コマンドのtool/result（09:35:34.034 UTC、固定ラベルのVERIFY_JSON）を親が確認した。
+その後09:35:34.035のstep/startから120.003秒後にassistant/attemptとturn/endが記録され、workerは317741msでtask_timeout_errorになった。
+返却error.messageには9a7e4a4で追加した診断がなく、起動済みMCPプロセスへの修正反映は確認できず、旧動作が継続している。再起動が必要。
+保護状態は当該taskに一致するbusy=false、親の読み取りも成功。実験結果の成功と報告生成の失敗を区別する。
+
+結論：長いheredoc、ファイル書込み、env -i後のGit起動だけでは停滞を再現しなかった。
+元のコマンド、同一シェルでの先行操作、保護環境、repository依存のgit status/logまで同一条件で再現したものではない。
+既存履歴にはGitのmissing config valueエラーがあるが、その呼出し自体はtool/resultを返しており、後続停滞との因果は未確定。
+SDK一般の不具合・配布元の不具合のどちらともまだ断定しない。次の比較対象は同一シェルの状態と実際の保護付き起動経路。
