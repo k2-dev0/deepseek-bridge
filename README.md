@@ -78,13 +78,14 @@ MCP clientが対象repositoryをcwdとして起動し、必要な`DEEPSEEK_API_K
 | Tool | 入力 | 動作 |
 |---|---|---|
 | `start_task` | `brief`、省略可能な`title` | 即座にtask ID、session ID、`running`を返す |
-| `wait_task` | `task_id`、`timeout_ms`（既定60000） | conditionで状態変化またはtimeoutを待つ |
+| `wait_task` | `task_id`、`timeout_ms`（既定60000） | 状態変化または新SDK activityで起床。timeout後もtaskはrunning |
 | `continue_task` | `task_id`、`message` | 同じtask/sessionを`running`へ戻す |
 | `abort_task` | `task_id` | 実行中worker/runtimeを回収し`aborted`にする |
 
 `brief`/`message`は1〜32,000文字、`title`は1〜200文字。空白だけの入力、credentialらしい入力、環境に設定されたkeyの混入を拒否する。
 credential検出は防御の補助であり、任意形式のsecretをすべて見つける保証はない。secretをタスクへ渡さないこと。
 `timeout_ms`は整数0〜60,000。timeoutやwait requestの取消は、実行taskの失敗・取消を意味しない。
+`wait_task`はstatus変化または呼出時より新しいactivity sequenceで起床し、poll自体はactivity時刻を更新しない。
 
 ```text
 start → running → completed / needs_decision / failed / aborted / interrupted
@@ -92,9 +93,13 @@ completed / needs_decision → running  （continue_task）
 failed / aborted / interrupted        （終端）
 ```
 
-`wait_task`は`task_id/session_id/status/progress/final_response/finish_reason/error`を返す。
+`wait_task`は`task_id/session_id/status/started_at/last_activity_at/elapsed_ms/phase/observability/final_response/finish_reason/error`を返す。
+`started_at`/`last_activity_at`はUTC aware date-time、`elapsed_ms`は単調時計の非負整数。terminal後は`elapsed_ms`をfrozenする。
+`phase`は固定Literal語彙（`starting`/`process_start`/`run_start`/`turn_start`/`turn_end`/`step_start`/`step_end`/`tool_call`/`tool_result`/`model_attempt`/`assistant_message`/`user_message`/`system_message`とterminal status）。`observability`は`available`/`unavailable`。
+SDK `on_notification`の実eventだけで`last_activity_at`とphaseを更新し、`starting`/`process_start`/`run_start`/`step_start`/`tool_call`/`model_attempt`は次eventまで内部進捗を観測できないため`unavailable`、他の離散eventは`available`とする。
+terminal遷移は実処理終了・cleanup完了の事実として`last_activity_at`/activity sequence/phaseをterminal statusへ進め、`observability`を`available`にする。wait/pollはactivity時刻を更新しない。
+event本文・tool引数・model出力・例外本文・secretはsnapshotへ出さず、executorからqueueされた最終activityもterminal公開前に処理する。
 `final_response`は次節の検証済みobjectまたはnull。`error`は短い`class/message`またはnull。
-running時の進捗は固定の短文だけで、modelのstreamやtool result全文を繰り返し返さない。
 stdioの1 request行は最大1 MiB。入力pipeは非同期に読み、JSON受信途中でもsignalによる終了を待たせない。
 
 同一process内では1 taskだけがwriter。start/continueの競合は片方を拒否する。
@@ -105,12 +110,18 @@ failed taskの暗黙resumeはなく、runtime crash・abort後のfresh taskで�
 SDK protocolにcancel RPCがないため、abortは所有するruntimeの`close()`でshutdown、必要ならterminate/kill/waitを行う。
 初期化と終了を直列化し、初期化中の取消でmodel turnを始めない。初期化中のabortはSDKの30秒の初期化期限まで待つ場合がある。
 終了失敗は`abort_error`とし、新しいwriterを受け付けない。worktreeをGit reset/restore等で戻す処理はない。
+task全体のhard timeoutは既定20分、最終activityからのinactivity timeoutは既定120秒とし、通常の47秒stepをinactivityで打ち切らない。
+watchdogは単純sleepではなくconditionでactivity sequence/status変化を待ち、deadline到達後もcondition lock下で最新`last_activity_monotonic`とhard deadlineを再評価してからtimeout回収へ進む。
+timeout時は所有runtimeのclose、run future回収、executor shutdownを行い、成功時は`failed`+`task_timeout_error`で予約を解放しfresh taskを開始できる。
+cleanup失敗時は`failed`+`abort_error`として予約を保持し、fresh taskを拒否する。timeout・abort・shutdownの回収は`_cleanup` lockで直列化する。
+`continue_task`は同じsessionを維持し、runごとのstarted/last_activity/elapsed/deadline/stop状態をresetする。
 stdio EOF・SIGTERM・SIGINTでshutdownし、実行中taskを`interrupted`にしてworker/runtimeを回収する。
 task状態はメモリ内のみ。再起動後は以前のIDを受け付けず、自動resumeしない。clientがworktreeを確認してfresh taskを始める。
 
 ## Modelへの指示と最終応答
 
 各session開始時に共通指示を渡す。rootの`AGENTS.md`と必要な参照文書の確認、ユーザー変更の保持、調査・編集・検証、Git変更禁止、設定・secret・lockfileの無断変更禁止、外部送信・公開・deploy・課金操作禁止を含む。
+独立したsearch/readはsame stepへまとめ、already read fileをre-readしない指示も含む。
 判断が必要なら`needs_decision`を要求する。repositoryコードや環境変数一覧を共通指示へ埋め込まない。
 
 最終応答はMarkdown fenceなしのJSON object。以下の6 fieldをすべて必須とし、未知field、重複key、型違いを拒否する。
