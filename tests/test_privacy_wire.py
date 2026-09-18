@@ -11,6 +11,7 @@ import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 import pytest
 from conftest import bridge, final
@@ -397,3 +398,94 @@ async def test_active_shell_reaped_on_abort_or_shutdown(endpoint, wire_env, shut
         assert not any(t.name.startswith("deepseek-worker") for t in threading.enumerate())
     finally:
         await manager.shutdown()
+
+
+def test_git_execution_git_configuration_environment(endpoint, wire_env, monkeypatch):
+    endpoint["mode"] = "tool"
+    settings = (
+        ("core.hooksPath", "/dev/null"),
+        ("core.fsmonitor", "false"),
+        ("core.untrackedCache", "false"),
+        ("commit.gpgSign", "false"),
+        ("status.submoduleSummary", "false"),
+        ("gc.auto", "0"),
+        ("maintenance.auto", "false"),
+    )
+    monkeypatch.setenv("GIT_CONFIG_COUNT", str(len(settings)))
+    for index, (key, value) in enumerate(settings):
+        monkeypatch.setenv(f"GIT_CONFIG_KEY_{index}", key)
+        monkeypatch.setenv(f"GIT_CONFIG_VALUE_{index}", value)
+    monkeypatch.setenv("WIRE_SECRET_CANARY", "must-not-reach")
+    monkeypatch.setenv("WIRE_PASSWORD_CANARY", "must-not-reach")
+    monkeypatch.setenv("WIRE_TOKEN_CANARY", "must-not-reach")
+    checks = " && ".join(f"git config --get {key} >/dev/null" for key, _ in settings)
+    endpoint["command"] = (
+        "echo ENV_COUNT=$GIT_CONFIG_COUNT; "
+        "echo KEY_COUNT=$(printenv | grep -c GIT_CONFIG_KEY_); "
+        "echo VALUE_COUNT=$(printenv | grep -c GIT_CONFIG_VALUE_); "
+        "echo SECRET_CANARY_COUNT=$(printenv | grep -ci -e WIRE_SECRET_CANARY "
+        "-e WIRE_PASSWORD_CANARY -e WIRE_TOKEN_CANARY); "
+        + checks
+        + " && echo GIT_CONFIG_GET=0 || echo GIT_CONFIG_GET=1"
+    )
+    runner = bridge("runtime").Runtime(wire_env)
+    try:
+        runner.run(
+            "session-" + uuid.uuid4().hex,
+            "Run the fixture Git configuration check",
+            True,
+            threading.Event(),
+        )
+    finally:
+        runner.close()
+    assert len(endpoint["requests"]) == 2
+    tool_results = [
+        message for message in endpoint["requests"][-1]["messages"] if message.get("role") == "tool"
+    ]
+    assert tool_results, "the fixture shell tool produced no result"
+    observed = json.dumps(tool_results)
+    assert "ENV_COUNT=7" in observed
+    assert "KEY_COUNT=7" in observed
+    assert "VALUE_COUNT=7" in observed
+    assert "SECRET_CANARY_COUNT=0" in observed
+    assert "GIT_CONFIG_GET=0" in observed
+
+
+async def test_git_execution_pager_bypass_without_terminal_environment(
+    endpoint, wire_env, monkeypatch, tmp_path
+):
+    checkout = Path(__file__).resolve().parents[1]
+    home = tmp_path / "git-home"
+    home.mkdir()
+    tasks = bridge("tasks")
+    # Test-only shortened deadlines; TaskManager keeps its production values.
+    monkeypatch.setattr(tasks, "INACTIVITY_TIMEOUT_SECONDS", 30)
+    monkeypatch.setattr(tasks, "MODEL_WAIT_TIMEOUT_SECONDS", 30)
+    monkeypatch.setattr(tasks, "HARD_TIMEOUT_SECONDS", 90)
+    endpoint["mode"] = "tool"
+    endpoint["command"] = (
+        f"env -i PATH=$PATH HOME={home} git -c core.pager=delta -C {checkout} "
+        "status --porcelain; echo STATUS_EXIT=$?; "
+        f"env -i PATH=$PATH HOME={home} git -c core.pager=delta -C {checkout} "
+        "log --format=format:fixture -3; echo LOG_EXIT=$?; "
+        "echo GIT_EXECUTION_DONE"
+    )
+    manager = tasks.TaskManager(wire_env)
+    try:
+        task = await manager.start("Run the fixture Git pager command")
+        result = await wait_terminal(manager, task["task_id"], 60.0)
+        assert result["status"] == "completed", result
+        assert len(endpoint["requests"]) == 2
+        tool_results = [
+            message
+            for message in endpoint["requests"][-1]["messages"]
+            if message.get("role") == "tool"
+        ]
+        assert tool_results, "the fixture shell tool produced no result"
+        observed = json.dumps(tool_results)
+        assert "GIT_EXECUTION_DONE" in observed
+        assert "STATUS_EXIT=0" in observed
+        assert "LOG_EXIT=0" in observed
+    finally:
+        await manager.shutdown()
+    assert not any(t.name.startswith("deepseek-worker") for t in threading.enumerate())
