@@ -4,9 +4,17 @@ import json
 import os
 import re
 from pathlib import PurePosixPath, PureWindowsPath
-from typing import Annotated, Literal, Self
+from typing import Annotated, Any, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 type ErrorClass = Literal[
     "configuration_error",
@@ -16,11 +24,34 @@ type ErrorClass = Literal[
     "harness_start_error",
     "harness_protocol_error",
     "model_error",
+    "task_timeout_error",
     "task_contract_error",
     "abort_error",
     "internal_error",
 ]
 type Status = Literal["running", "completed", "needs_decision", "failed", "aborted", "interrupted"]
+
+type Phase = Literal[
+    "starting",
+    "process_start",
+    "run_start",
+    "turn_start",
+    "turn_end",
+    "step_start",
+    "step_end",
+    "tool_call",
+    "tool_result",
+    "model_attempt",
+    "assistant_message",
+    "user_message",
+    "system_message",
+    "completed",
+    "needs_decision",
+    "failed",
+    "aborted",
+    "interrupted",
+]
+
 
 MESSAGES: dict[ErrorClass, str] = {
     "configuration_error": "Invalid configuration, input, task ID, or task state.",
@@ -30,6 +61,7 @@ MESSAGES: dict[ErrorClass, str] = {
     "harness_start_error": "The pinned Harness runtime could not initialize.",
     "harness_protocol_error": "The Harness runtime or model stream violated the protocol.",
     "model_error": "The model did not complete the requested task.",
+    "task_timeout_error": "The task exceeded its hard or inactivity deadline.",
     "task_contract_error": "The final response violates the bounded JSON result contract.",
     "abort_error": "Runtime cleanup failed; no new writer will be accepted.",
     "internal_error": "An internal worker error occurred.",
@@ -132,6 +164,38 @@ class FinalResponse(StrictModel):
         return self
 
 
+class ErrorInfo(StrictModel):
+    error_class: ErrorClass = Field(alias="class")
+    message: Annotated[str, Field(min_length=1, max_length=500)]
+
+
+class WaitOutput(StrictModel):
+    task_id: TaskID
+    session_id: Annotated[str, Field(min_length=1, max_length=80)]
+    status: Status
+    started_at: AwareDatetime
+    last_activity_at: AwareDatetime
+    elapsed_ms: Annotated[int, Field(ge=0)]
+    phase: Phase
+    observability: Literal["available", "unavailable"]
+    final_response: FinalResponse | None
+    finish_reason: Annotated[str, Field(min_length=1, max_length=100)] | None
+    error: ErrorInfo | None
+
+
+def wait_output_schema() -> dict[str, Any]:
+    """WaitOutput JSON schema with the fixed phase enum inlined for consumers."""
+    schema = WaitOutput.model_json_schema(by_alias=True)
+    phase = schema["properties"]["phase"]
+    ref = phase.get("$ref")
+    if isinstance(ref, str):
+        definition = schema.get("$defs", {}).pop(ref.rsplit("/", 1)[-1], None)
+        if isinstance(definition, dict):
+            phase.clear()
+            phase.update(definition)
+    return schema
+
+
 def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     result: dict[str, object] = {}
     for key, value in pairs:
@@ -155,6 +219,7 @@ def parse_final(response: str) -> FinalResponse:
 
 COMMON_INSTRUCTIONS = """You are a repository worker. First read AGENTS.md at the repository root.
 Read only referenced documents needed for this task. Preserve existing user changes.
+Batch independent searches and reads into the same step, and do not re-read files you already read.
 Investigate, edit, test, typecheck and lint within this repository.
 Never stage, commit, branch, rebase, reset, checkout, restore, clean, or write .git.
 Do not change agent configuration, secrets, credentials or lockfiles
