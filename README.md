@@ -116,6 +116,8 @@ timeout/abort/shutdownの回収はgraceful `close()`を固定猶予だけ待ち�
 force stop失敗、close task/worker未終了、process poll残存、executor回収失敗は`failed`+`abort_error`として予約を保持し、確認できた場合だけtimeoutは`failed`+`task_timeout_error`で予約を解放する。
 timeout時は所有runtimeのclose、run future回収、executor shutdownを行い、成功時は`failed`+`task_timeout_error`で予約を解放しfresh taskを開始できる。
 cleanup失敗時は`failed`+`abort_error`として予約を保持し、fresh taskを拒否する。timeout・abort・shutdownの回収は`_cleanup` lockで直列化する。
+shutdownはrunning taskに加え、`failed`+`abort_error`で予約を保持したterminal task、未完了のpending close、idleなruntime/executorも同じ固定期限の回収経路で扱い、`_pending_close`に未完了のclose taskがあれば重複closeを起動せず再利用する。
+再回収の成功時だけ`_active`/executor/runtimeを回収済みにしてtaskは`failed`+`abort_error`のまま保持し、再回収の失敗時は固定時間内に`abort_error`を返して予約/poison状態を保持する。
 `continue_task`は同じsessionを維持し、runごとのstarted/last_activity/elapsed/deadline/stop状態をresetする。
 stdio EOF・SIGTERM・SIGINTでshutdownし、実行中taskを`interrupted`にしてworker/runtimeを回収する。
 task状態はメモリ内のみ。再起動後は以前のIDを受け付けず、自動resumeしない。clientがworktreeを確認してfresh taskを始める。
