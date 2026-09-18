@@ -15,7 +15,14 @@ from mcp.server.stdio import stdio_server
 from pydantic import ValidationError
 
 from . import __version__
-from .protocol import AbortInput, BridgeError, ContinueInput, StartInput, WaitInput
+from .protocol import (
+    AbortInput,
+    BridgeError,
+    ContinueInput,
+    StartInput,
+    WaitInput,
+    wait_output_schema,
+)
 from .runtime import bind_workspace, validate_environment
 from .tasks import TaskManager
 
@@ -27,7 +34,10 @@ INPUTS: dict[str, type[StartInput] | type[WaitInput] | type[ContinueInput] | typ
 }
 DESCRIPTIONS = {
     "start_task": "Start one background task in the bound repository (brief <= 32000 characters).",
-    "wait_task": "Wait on task state for 0..60000 ms; a timeout leaves the task running.",
+    "wait_task": (
+        "Wait on task status or new SDK activity for 0..60000 ms; "
+        "a timeout leaves the task running."
+    ),
     "continue_task": "Continue a completed or needs_decision task in the same Harness session.",
     "abort_task": "Stop the active task and reclaim its runtime; preserve worktree changes.",
 }
@@ -50,16 +60,17 @@ async def serve() -> None:
     manager = TaskManager(workspace)
 
     async def list_tools(context: Any, params: Any) -> types.ListToolsResult:
-        return types.ListToolsResult(
-            tools=[
-                types.Tool(
-                    name=name,
-                    description=DESCRIPTIONS[name],
-                    input_schema=model.model_json_schema(),
-                )
-                for name, model in INPUTS.items()
-            ]
-        )
+        tools = []
+        for name, model in INPUTS.items():
+            tool = types.Tool(
+                name=name,
+                description=DESCRIPTIONS[name],
+                input_schema=model.model_json_schema(),
+            )
+            if name == "wait_task":
+                tool.output_schema = wait_output_schema()
+            tools.append(tool)
+        return types.ListToolsResult(tools=tools)
 
     async def call_tool(context: Any, params: types.CallToolRequestParams) -> types.CallToolResult:
         try:
