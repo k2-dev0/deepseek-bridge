@@ -140,7 +140,7 @@ def test_task_timeout_defaults(gate):
     assert gate.INACTIVITY_TIMEOUT_SECONDS == 120
     assert gate.CLEANUP_GRACE_SECONDS > 0
     assert gate.CLEANUP_JOIN_SECONDS > 0
-    assert gate.EXECUTOR_JOIN_SECONDS > 0
+    assert gate.CLEANUP_FORCE_SECONDS > 0
 
 
 def utc(value):
