@@ -35,8 +35,8 @@ INPUTS: dict[str, type[StartInput] | type[WaitInput] | type[ContinueInput] | typ
 DESCRIPTIONS = {
     "start_task": "Start one background task in the bound repository (brief <= 32000 characters).",
     "wait_task": (
-        "Wait on task status or new SDK activity for 0..60000 ms; "
-        "a timeout leaves the task running."
+        "Wait until terminal status or timeout for 0..60000 ms; "
+        "a timeout returns the current snapshot and leaves the task running."
     ),
     "continue_task": (
         "Continue a completed or needs_decision task in the same Harness session. "
