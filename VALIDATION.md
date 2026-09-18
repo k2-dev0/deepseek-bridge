@@ -155,3 +155,65 @@ workerの最終報告は得られていない。実験コマンドのtool/result
 元のコマンド、同一シェルでの先行操作、保護環境、repository依存のgit status/logまで同一条件で再現したものではない。
 既存履歴にはGitのmissing config valueエラーがあるが、その呼出し自体はtool/resultを返しており、後続停滞との因果は未確定。
 SDK一般の不具合・配布元の不具合のどちらともまだ断定しない。次の比較対象は同一シェルの状態と実際の保護付き起動経路。
+
+### 引継ぎ後の切り分け：Git pager待ちを再現（2026-09-18）
+
+開始時HEADは`91de7eb`、追跡対象の差分なし。production code・SDK・配布元設定・通常期限・worker保護状態は変更していない。
+
+**ロード確認の範囲。** MCP設定は`deepseek-launch.sh → mcp-protected.sh → deepseek-bridge`。
+PATH上の`~/.local/bin/deepseek-bridge`はこのrepositoryの`.venv/bin/deepseek-bridge`へのsymlinkで、同venvのPythonから`deepseek_bridge.server`を起動する。
+新規Pythonのimport先は`src/deepseek_bridge/tasks.py`、既定期限はhard=1200秒・activity=120秒・model=600秒だった。
+`ps`は保護付き入口でもOS拒否。既存のlibproc照会でプロセス起動時刻と実行pathは取得できたが、複数のPythonプロセスのどれがこの会話のMCPかまでは識別していない。
+したがって**既存MCPへの修正版ロードは未確定**とし、この調査ではMCP workerを起動しなかった。
+
+以下は、保護付き`outside.sh`から新規起動した診断専用Pythonと実bridge/SDK/runtimeの結果。
+各childで実行PID・import path・source SHA-256・既定期限・runtime binary pathを記録した。
+`tasks.py`のSHA-256は`6dea5e9573ee227d4cac7b378733bb754ff79db6466e2adfdb57b6113079bfa0`。
+既定値の記録後、そのchild内だけhard=25秒・activity=5秒・model=8秒に変更した。
+timeout時には修正後の`timeout=inactivity; phase=tool_call; deadline_seconds=5; waiting_for=activity`を実際に取得した。
+旧120秒判定を続けるMCPの結果とは混ぜない。
+
+**実験境界。** モデル接続先はloopbackの合成SSEだけ。HTTPはsandbox外の保護付き入口で実行した。
+各caseに別の一時workspace・HOME・state・sessionを割り当てた。通常stateやAPI keyを実験用に変更していない。
+Git initは現在のGit hookに拒否されたため、新しいrepositoryを作成せず、既存の合成fixture `/private/tmp/deepseek-bash-investigation/shell-git` を`status/log`で読み取った。
+このfixtureの作成処理や配布元scriptは再実行・変更していない。
+観測pluginは診断processだけに挿入し、terminal生成、stdin書込み開始/終了、OSC完了マーカー、前景PGID/inputWaitingを記録した。
+秘密・コマンド本文・プロンプト・応答本文・PTY本文は診断ログに記録していない。
+これは専用wire runnerの成功を示すものでも、OSによるloopback限定egressを再検証した結果でもない。
+
+| case | 結果 | モデルへ返ったtool結果 | 開始から回収まで |
+|---|---|---:|---:|
+| `env -i PATH/HOME`のみでGit status/log | activity timeout | 0/1 | 8.145秒 |
+| 同じ操作に`git --no-pager`を追加 | completed | 1/1 | 3.845秒 |
+| 同じ操作で`PAGER=cat GIT_PAGER=cat`も渡す | completed | 1/1 | 3.978秒 |
+| Git設定値欠落を合成した呼出しの後にenv-i Git | 先行呼出しは返却、後続がtimeout | 1/2 | 8.880秒 |
+| 同一bashでexport・cd・書込み24回・pager無効Git・cd・500行heredoc | completed、20000 bytes | 29/29 | 8.369秒 |
+| fresh sessionの500行heredoc | completed、20000 bytes | 1/1 | 3.899秒 |
+| cd・引用heredoc・後続echo/catを組み合わせた合成コマンド | completed | 3/3 | 4.147秒 |
+| 対照：`sleep 15` | activity timeout | 0/1 | 7.824秒 |
+
+**Gitで確認した停止位置。** timeout前の3秒時点でstdin書込みは完了していたが、後続確認fileはまだなく、前景に`bash → git → less`が残った。
+PIDはbash=40433、git=40450、less=40452、前景PGID=40450。観測されたOSCマーカー2個は初期化時だけで、コマンド終了後のマーカーはなかった。
+`--no-pager`またはpager環境変数の保持だけで正常完了に変わったので、この合成caseの原因はpager待ち。
+コマンド投入前の停滞や、終了済みコマンドの完了マーカーをSDKが取りこぼした現象ではない。
+
+固定runtime 0.1.5rc1の埋込みsourceも確認した。
+`childEnvironment`は通常のterminalに`PAGER=cat`と`GIT_PAGER=cat`を設定するが、コマンド側の`env -i`は両方を除く。
+macOSの`MacProcessInspector.isStdinWaiting`は常に`false`。persistent bashの`executeCommand`は独自の終了マーカーまたは`stdin_read`を待ち、`inferred_idle`だけではtool結果を返さず再待機する。
+bash toolの既定deadlineは300秒で、bridgeの通常activity期限120秒より長い。この経路では対話入力待ちのlessがtool/callを維持し、先にbridge期限へ到達し得る。
+macOS互換pluginは既存の2種類のps照会を置き換えるだけで、入力待ち判定は変更していない。
+
+**回収時の観測に注意。** Gitとsleepの両対照で、停止前にはなかった後続確認fileと終了マーカーが回収処理中に現れた。
+したがって、回収後のfile存在・終了マーカーだけで「timeout前に本来のコマンドは完了していた」と判定してはいけない。
+各caseのmanager.shutdownと外側supervisorの45秒上限・TERM/KILL回収を使用した。終了時のworker threadと観測shell残数は0。
+最後に今回把握した診断child・runtime・bash・Git・less・sleepの計30 PIDを照会し、残存0を確認した。全OSプロセスの完全監査とは区別する。
+
+**元事象への適用範囲。** bridge側`task-e61f1491c13d4877a40e9f60f93ae84d`の最終呼出しにはPATH/HOMEのみのenv-i Git logがあり、pager無効化指定がない。
+今回の対照はその停滞を説明する具体的な再現経路になった。ただし元実行時のプロセス木は保存されておらず、元taskでもlessが残っていたことの直接証明ではない。
+別のheredoc 2件は未解決。保存履歴上のコマンドは1358 bytes/32行と1365 bytes/33行、終端行は正しく、bash構文検査は両方exit 0、tab/newline以外の制御文字なし。
+先行コマンドからPROMPT_COMMAND/PS1/PS2、stty、set/shopt、trap、sourceへの操作は検出されなかった。これは文字列検査であり、間接的な状態変更の不存在を保証しない。
+同じsessionで11830 bytes/365行の先行heredocが175msでtool/resultを返していたことも確認した。
+heredoc一般・長さ・単純な先行操作だけを原因とはできず、Git pagerの原因をこの2件へ拡張しない。
+
+診断scriptと合成結果は管理外の`.codex/e2e/artifacts/`に保存した。
+通常テスト・型検査・lintの前回結果は更新していない。今回はアプリ変更なしの原因調査であり、新たな修正完了や全件解決とは扱わない。
