@@ -112,6 +112,8 @@ SDK protocolにcancel RPCがないため、abortは所有するruntimeの`close(
 終了失敗は`abort_error`とし、新しいwriterを受け付けない。worktreeをGit reset/restore等で戻す処理はない。
 task全体のhard timeoutは既定20分、最終activityからのinactivity timeoutは既定120秒とし、通常の47秒stepをinactivityで打ち切らない。
 watchdogは単純sleepではなくconditionでactivity sequence/status変化を待ち、deadline到達後もcondition lock下で最新`last_activity_monotonic`とhard deadlineを再評価してからtimeout回収へ進む。
+timeout/abort/shutdownの回収はgraceful `close()`を固定猶予だけ待ち、猶予超過時はclose taskをcancelせず、所有Harness process（`harness.client._proc`）だけをterminate→有限wait→kill→有限waitで強制停止してpipe/writeを解除し、close taskとrun workerを固定猶予でjoinする。他processの検索・killやprocess出力・例外本文の公開はしない。
+force stop失敗、close task/worker未終了、process poll残存、executor回収失敗は`failed`+`abort_error`として予約を保持し、確認できた場合だけtimeoutは`failed`+`task_timeout_error`で予約を解放する。
 timeout時は所有runtimeのclose、run future回収、executor shutdownを行い、成功時は`failed`+`task_timeout_error`で予約を解放しfresh taskを開始できる。
 cleanup失敗時は`failed`+`abort_error`として予約を保持し、fresh taskを拒否する。timeout・abort・shutdownの回収は`_cleanup` lockで直列化する。
 `continue_task`は同じsessionを維持し、runごとのstarted/last_activity/elapsed/deadline/stop状態をresetする。
