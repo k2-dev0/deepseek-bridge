@@ -191,6 +191,29 @@ async def test_sdk_event_wakes_wait_and_updates_activity_without_payload_leak(sd
         await manager.shutdown()
 
 
+async def test_common_instructions_env_and_exact_session_prompts(sdk_gate, repo):
+    manager = bridge("tasks").TaskManager(repo)
+    instructions = bridge("protocol").COMMON_INSTRUCTIONS
+    try:
+        task = await manager.start("Inspect the repository")
+        assert await asyncio.to_thread(sdk_gate.entered.wait, 2)
+        assert sdk_gate.harness_env["DSH_SYSTEM_PROMPT"] == instructions
+        assert sdk_gate.prompts == ["Inspect the repository"]
+        sdk_gate.release.set()
+        assert (await manager.wait(task["task_id"], 2000))["status"] == "completed"
+        sdk_gate.entered.clear()
+        sdk_gate.release.clear()
+        assert (await manager.continue_task(task["task_id"], "Follow up"))["status"] == "running"
+        assert await asyncio.to_thread(sdk_gate.entered.wait, 2)
+        assert sdk_gate.prompts == ["Inspect the repository", "Follow up"]
+        assert sdk_gate.session_ids == [task["session_id"], task["session_id"]]
+        sdk_gate.release.set()
+        assert (await manager.wait(task["task_id"], 2000))["status"] == "completed"
+    finally:
+        sdk_gate.release.set()
+        await manager.shutdown()
+
+
 async def test_timeout_cleanup_failure_keeps_reservation(gate, repo, monkeypatch):
     monkeypatch.setattr(gate, "HARD_TIMEOUT_SECONDS", 0.5, raising=False)
     monkeypatch.setattr(gate, "INACTIVITY_TIMEOUT_SECONDS", 60.0, raising=False)
