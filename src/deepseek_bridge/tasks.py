@@ -277,14 +277,18 @@ class TaskManager:
             self._schedule(task, value.brief, True)
             return task.accepted()
 
-    async def wait(self, task_id: str, timeout_ms: int = 60000) -> dict[str, Any]:
+    async def wait(self, task_id: str, timeout_ms: int | None = None) -> dict[str, Any]:
         try:
-            WaitInput(task_id=task_id, timeout_ms=timeout_ms)
+            WaitInput(task_id=task_id)
         except ValidationError:
             raise BridgeError("configuration_error") from None
+        if timeout_ms is not None and (type(timeout_ms) is not int or not 0 <= timeout_ms <= 60000):
+            raise BridgeError("configuration_error")
         async with self._condition:
             task = self._lookup(task_id)
-            if task.status == "running" and timeout_ms:
+            if task.status == "running" and timeout_ms is None:
+                await self._condition.wait_for(self._terminal_predicate(task))
+            elif task.status == "running" and timeout_ms:
                 try:
                     await asyncio.wait_for(
                         self._condition.wait_for(self._terminal_predicate(task)),
