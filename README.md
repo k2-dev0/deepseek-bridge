@@ -98,7 +98,7 @@ failed / aborted / interrupted        （終端）
 `phase`は固定Literal語彙（`starting`/`process_start`/`run_start`/`turn_start`/`turn_end`/`step_start`/`step_end`/`tool_call`/`tool_result`/`model_attempt`/`assistant_message`/`user_message`/`system_message`とterminal status）。`observability`は`available`/`unavailable`。
 SDK `on_notification`の実eventだけで`last_activity_at`とphaseを更新し、`starting`/`process_start`/`run_start`/`step_start`/`tool_call`/`model_attempt`は次eventまで内部進捗を観測できないため`unavailable`、他の離散eventは`available`とする。
 terminal遷移は実処理終了・cleanup完了の事実として`last_activity_at`/activity sequence/phaseをterminal statusへ進め、`observability`を`available`にする。wait/pollはactivity時刻を更新しない。
-event本文・tool引数・model出力・例外本文・secretはsnapshotへ出さず、executorからqueueされた最終activityもterminal公開前に処理する。
+event本文・tool引数・model出力・例外本文・secretはsnapshotへ出さず、worker threadからqueueされた最終activityもterminal公開前に処理する。
 `final_response`は次節の検証済みobjectまたはnull。`error`は短い`class/message`またはnull。
 stdioの1 request行は最大1 MiB。入力pipeは非同期に読み、JSON受信途中でもsignalによる終了を待たせない。
 
@@ -113,11 +113,12 @@ SDK protocolにcancel RPCがないため、abortは所有するruntimeの`close(
 task全体のhard timeoutは既定20分、最終activityからのinactivity timeoutは既定120秒とし、通常の47秒stepをinactivityで打ち切らない。
 watchdogは単純sleepではなくconditionでactivity sequence/status変化を待ち、deadline到達後もcondition lock下で最新`last_activity_monotonic`とhard deadlineを再評価してからtimeout回収へ進む。
 timeout/abort/shutdownの回収はgraceful `close()`を固定猶予だけ待ち、猶予超過時はclose taskをcancelせず、所有Harness process（`harness.client._proc`）だけをterminate→有限wait→kill→有限waitで強制停止してpipe/writeを解除し、close taskとrun workerを固定猶予でjoinする。他processの検索・killやprocess出力・例外本文の公開はしない。
-force stop失敗、close task/worker未終了、process poll残存、executor回収失敗は`failed`+`abort_error`として予約を保持し、確認できた場合だけtimeoutは`failed`+`task_timeout_error`で予約を解放する。
-timeout時は所有runtimeのclose、run future回収、executor shutdownを行い、成功時は`failed`+`task_timeout_error`で予約を解放しfresh taskを開始できる。
+run/close/force stopはbridgeが所有するdaemon threadで実行し、graceful close・force stop・close join・run joinをそれぞれ最大5秒待つ。成功には実threadの終了とjoinを要求する。停止したcallをdefault executorへ投入しないため、回収失敗後にPython終了処理が同じthreadを無期限joinし直すことはない。
+force stop失敗、close/worker未終了、process poll残存は`failed`+`abort_error`として予約を保持する。daemon指定を回収成功とはみなさず、CLI終了時も`abort_error`を報告する。所有processを停止できなかった場合はhost側で残processを確認する。
+timeout時は所有runtimeのcloseとrun/thread回収を行い、成功時は`failed`+`task_timeout_error`で予約を解放しfresh taskを開始できる。
 cleanup失敗時は`failed`+`abort_error`として予約を保持し、fresh taskを拒否する。timeout・abort・shutdownの回収は`_cleanup` lockで直列化する。
-shutdownはrunning taskに加え、`failed`+`abort_error`で予約を保持したterminal task、未完了のpending close、idleなruntime/executorも同じ固定期限の回収経路で扱い、`_pending_close`に未完了のclose taskがあれば重複closeを起動せず再利用する。
-再回収の成功時だけ`_active`/executor/runtimeを回収済みにしてtaskは`failed`+`abort_error`のまま保持し、再回収の失敗時は固定時間内に`abort_error`を返して予約/poison状態を保持する。
+shutdownはrunning taskに加え、`failed`+`abort_error`で予約を保持したterminal task、未完了のclose/force stop、idleなruntimeも同じ固定期限の回収経路で扱う。未回収callのhandleを保持して再利用し、停止中のclose/force stopを重複起動しない。
+再回収の成功時だけ`_active`/run thread/runtimeを回収済みにしてtaskは`failed`+`abort_error`のまま保持し、再回収の失敗時は固定時間内に`abort_error`を返して予約/poison状態を保持する。
 `continue_task`は同じsessionを維持し、runごとのstarted/last_activity/elapsed/deadline/stop状態をresetする。
 stdio EOF・SIGTERM・SIGINTでshutdownし、実行中taskを`interrupted`にしてworker/runtimeを回収する。
 task状態はメモリ内のみ。再起動後は以前のIDを受け付けず、自動resumeしない。clientがworktreeを確認してfresh taskを始める。
