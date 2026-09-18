@@ -86,6 +86,7 @@ MCP clientが対象repositoryをcwdとして起動し、必要な`DEEPSEEK_API_K
 credential検出は防御の補助であり、任意形式のsecretをすべて見つける保証はない。secretをタスクへ渡さないこと。
 `timeout_ms`は整数0〜60,000。timeoutやwait requestの取消は、実行taskの失敗・取消を意味しない。
 `wait_task`はstatus変化または呼出時より新しいactivity sequenceで起床し、poll自体はactivity時刻を更新しない。
+`continue_task`は同じsession履歴を再利用する。同じsessionへは差分・新情報だけを`message`で渡し、初回briefや確認済み要件を繰り返さない。明示的な訂正・追加はそのまま渡す。bridgeは`message`の自動要約・重複判定・文字列削除をしない。
 
 ```text
 start → running → completed / needs_decision / failed / aborted / interrupted
@@ -158,6 +159,7 @@ OTEL_SDK_DISABLED=true
 ```
 
 通常のsystem prompt、user message、tool call、tool resultはmodelの入力としてDeepSeekへ送信される。
+共通指示（COMMON_INSTRUCTIONS）はchild環境の`DSH_SYSTEM_PROMPT`としてsystem側に1回だけ渡し、fresh/continueともuser本文はcallerの`message`そのものとする。
 追加の`dsh_session_log`と`dsh_plugin_packages`を送らない。bridge独自のtelemetryやanalyticsはない。
 bridgeはSDK/MCPの生のdiagnostic loggingを無効にし、stderrには固定のsanitized errorだけを出す。
 key、header、prompt/response全文、file内容、tool result全文、環境変数一覧をlogしない。
