@@ -174,6 +174,10 @@ class Runtime:
     def run(self, session_id, message, fresh, stop, *args, **kwargs):
         self.done.wait(10)
         return RunResult(session_id, '{{}}', 'completed', [], [])
+    def owned_process(self):
+        return None
+    def force_stop(self):
+        return True
     def close(self):
         self.done.set()
 tasks.Runtime = Runtime
