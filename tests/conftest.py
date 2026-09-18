@@ -104,6 +104,9 @@ def sdk_gate(monkeypatch, tmp_path):
             self.release = threading.Event()
             self.closed = 0
             self.session_id = None
+            self.session_ids = []
+            self.harness_env = None
+            self.prompts = []
             self.on_notification = None
             self.response = final()
             self.finish_reason = "completed"
@@ -125,6 +128,7 @@ def sdk_gate(monkeypatch, tmp_path):
 
     class Session:
         def run(self, prompt, *, on_notification=None):
+            controller.prompts.append(prompt)
             controller.on_notification = on_notification
             controller.entered.set()
             assert controller.release.wait(5), "test did not release SDK session"
@@ -141,6 +145,7 @@ def sdk_gate(monkeypatch, tmp_path):
 
     class Harness:
         def __init__(self, **kwargs):
+            controller.harness_env = kwargs.get("env")
             self.client = Client()
 
         def start(self):
@@ -148,6 +153,7 @@ def sdk_gate(monkeypatch, tmp_path):
 
         def start_session(self, session_id):
             controller.session_id = session_id
+            controller.session_ids.append(session_id)
             return Session()
 
         def close(self):
