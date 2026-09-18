@@ -64,11 +64,9 @@ def test_schema_and_boundaries(monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "unique-canary-secret")
     with pytest.raises(ValueError):
         p.StartInput(brief="include unique-canary-secret please")
-    for value in (-1, 60001, True, 1.5, "100"):
-        with pytest.raises(ValueError):
-            p.WaitInput(task_id="task-x", timeout_ms=value)
-    assert p.WaitInput(task_id="task-x", timeout_ms=0).timeout_ms == 0
-    assert p.WaitInput(task_id="task-x", timeout_ms=60000).timeout_ms == 60000
+    assert p.WaitInput(task_id="task-x").model_dump() == {"task_id": "task-x"}
+    with pytest.raises(ValueError):
+        p.WaitInput(task_id="task-x", timeout_ms=0)
 
 
 @pytest.mark.parametrize(
