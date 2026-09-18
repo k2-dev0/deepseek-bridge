@@ -29,6 +29,10 @@ from .runtime import Runtime
 
 HARD_TIMEOUT_SECONDS = 20 * 60
 INACTIVITY_TIMEOUT_SECONDS = 120
+# Fixed bounds for graceful close, owned-process force stop and joins.
+CLEANUP_GRACE_SECONDS = 5.0
+CLEANUP_JOIN_SECONDS = 5.0
+EXECUTOR_JOIN_SECONDS = 5.0
 ACTIVITY_PHASES = frozenset(
     {
         "process_start",
@@ -111,6 +115,7 @@ class TaskManager:
         self._activity_lock = threading.Lock()
         self._activity_queue: list[tuple[Task, str]] = []
         self._pending_notify: set[asyncio.Task[None]] = set()
+        self._pending_close: set[asyncio.Task[None]] = set()
 
     def _transition(self, task: Task, status: Status) -> None:
         allowed = {
@@ -375,12 +380,7 @@ class TaskManager:
             task.stopping = True
             task.stop.set()
         try:
-            await asyncio.to_thread(self.runtime.close)
-            if task.worker is not None:
-                await asyncio.shield(task.worker)
-            if self._executor is not None:
-                await asyncio.to_thread(self._executor.shutdown, wait=True, cancel_futures=True)
-                self._executor = None
+            await self._recover_resources(task)
         except Exception:
             async with self._condition:
                 self._poisoned = True
@@ -390,6 +390,46 @@ class TaskManager:
         async with self._condition:
             self._transition(task, status)
             self._active = None
+
+    async def _recover_resources(self, task: Task) -> None:
+        # The graceful close may block indefinitely on a stuck SDK pipe write;
+        # every wait below is bounded, and a pending close task is never cancelled.
+        process = self.runtime.owned_process()
+        close_task = asyncio.create_task(asyncio.to_thread(self.runtime.close))
+        self._pending_close.add(close_task)
+        close_task.add_done_callback(self._pending_close.discard)
+        done, _ = await asyncio.wait({close_task}, timeout=CLEANUP_GRACE_SECONDS)
+        if not done:
+            # Force-stop only the captured owned process so close can unblock,
+            # then join the close task with a second fixed bound.
+            forced = await asyncio.to_thread(self.runtime.force_stop)
+            if not forced:
+                raise BridgeError("abort_error")
+            done, _ = await asyncio.wait({close_task}, timeout=CLEANUP_JOIN_SECONDS)
+        if not done:
+            raise BridgeError("abort_error")
+        if close_task.exception() is not None:
+            raise BridgeError("abort_error")
+        if process is not None and process.poll() is None:
+            raise BridgeError("abort_error")
+        if task.worker is not None:
+            done, _ = await asyncio.wait({task.worker}, timeout=CLEANUP_JOIN_SECONDS)
+            if not done:
+                raise BridgeError("abort_error")
+            try:
+                task.worker.result()
+            except Exception:
+                raise BridgeError("abort_error") from None
+        if self._executor is not None:
+            # executor.shutdown(wait=True) runs only after worker termination.
+            try:
+                await asyncio.wait_for(
+                    asyncio.to_thread(self._executor.shutdown, wait=True, cancel_futures=True),
+                    EXECUTOR_JOIN_SECONDS,
+                )
+            except Exception:
+                raise BridgeError("abort_error") from None
+            self._executor = None
 
     async def abort(self, task_id: str) -> dict[str, str]:
         try:
