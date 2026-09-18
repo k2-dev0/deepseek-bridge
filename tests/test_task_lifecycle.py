@@ -27,6 +27,9 @@ async def test_start_wait_continue_and_reuse(gate, repo):
         done = await waiter
         assert done["status"] == "completed"
         assert done["final_response"]["summary"] == "Done"
+        assert done["phase"] == "completed"
+        assert done["observability"] == "available"
+        assert done["last_activity_at"] >= done["started_at"]
         assert await manager.continue_task(task["task_id"], "Follow up") == task
         assert (await manager.wait(task["task_id"], 1000))["status"] == "completed"
         calls = manager.runtime.calls
@@ -46,7 +49,11 @@ async def test_model_status_and_continue_rules(gate, repo, status):
     manager.runtime.release.set()
     try:
         task = await manager.start("Implement the change")
-        assert (await manager.wait(task["task_id"], 1000))["status"] == status
+        result = await manager.wait(task["task_id"], 1000)
+        assert result["status"] == status
+        assert result["phase"] == status
+        assert result["observability"] == "available"
+        assert result["last_activity_at"] >= result["started_at"]
         if status == "failed":
             with pytest.raises(gate.BridgeError):
                 await manager.continue_task(task["task_id"], "Retry")
@@ -64,6 +71,10 @@ async def test_abort_is_idempotent_and_preserves_worktree(gate, repo):
     aborted = await manager.abort(task["task_id"])
     assert aborted["status"] == "aborted"
     assert await manager.abort(task["task_id"]) == aborted
+    terminal = await manager.wait(task["task_id"], 0)
+    assert terminal["phase"] == "aborted"
+    assert terminal["observability"] == "available"
+    assert terminal["last_activity_at"] >= terminal["started_at"]
     assert (repo / "user-edit").read_text() == "keep me"
     assert not any(t.name.startswith("deepseek-worker") for t in threading.enumerate())
     with pytest.raises(gate.BridgeError):
@@ -71,7 +82,10 @@ async def test_abort_is_idempotent_and_preserves_worktree(gate, repo):
     fresh = await manager.start("Fresh work")
     assert fresh["session_id"] != task["session_id"]
     await manager.shutdown()
-    assert (await manager.wait(fresh["task_id"], 0))["status"] == "interrupted"
+    interrupted = await manager.wait(fresh["task_id"], 0)
+    assert interrupted["status"] == "interrupted"
+    assert interrupted["phase"] == "interrupted"
+    assert interrupted["observability"] == "available"
     with pytest.raises(gate.BridgeError):
         await manager.start("After shutdown")
 
@@ -150,8 +164,8 @@ async def test_wait_snapshot_contract_and_poll_keeps_activity(gate, repo):
         assert activity >= started
         assert type(snap["elapsed_ms"]) is int
         assert snap["elapsed_ms"] >= 0
-        assert isinstance(snap["phase"], str) and snap["phase"]
-        assert snap["observability"] in {"available", "unavailable"}
+        assert snap["phase"] == "starting"
+        assert snap["observability"] == "unavailable"
         await manager.wait(task["task_id"], 1)
         again = await manager.wait(task["task_id"], 0)
         assert again["started_at"] == snap["started_at"]
@@ -172,6 +186,9 @@ async def test_task_hard_timeout_cleans_up_and_releases_reservation(gate, repo, 
         await wait_entered(manager.runtime)
         result = await manager.wait(task["task_id"], 3000)
         assert result["status"] == "failed"
+        assert result["phase"] == "failed"
+        assert result["observability"] == "available"
+        assert result["last_activity_at"] >= result["started_at"]
         assert result["error"]["class"] == "task_timeout_error"
         assert result["final_response"] is None
         assert manager.runtime.closed >= 1
@@ -192,6 +209,8 @@ async def test_task_inactivity_timeout_fires_without_activity(gate, repo, monkey
         await wait_entered(manager.runtime)
         result = await manager.wait(task["task_id"], 3000)
         assert result["status"] == "failed"
+        assert result["phase"] == "failed"
+        assert result["observability"] == "available"
         assert result["error"]["class"] == "task_timeout_error"
         assert manager.runtime.closed >= 1
     finally:
