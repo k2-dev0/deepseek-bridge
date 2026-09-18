@@ -5,13 +5,13 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, cast
 
+from deepseek_harness import RunResult
 from pydantic import ValidationError
 
 from .protocol import (
@@ -32,7 +32,7 @@ INACTIVITY_TIMEOUT_SECONDS = 120
 # Fixed bounds for graceful close, owned-process force stop and joins.
 CLEANUP_GRACE_SECONDS = 5.0
 CLEANUP_JOIN_SECONDS = 5.0
-EXECUTOR_JOIN_SECONDS = 5.0
+CLEANUP_FORCE_SECONDS = 5.0
 ACTIVITY_PHASES = frozenset(
     {
         "process_start",
@@ -57,6 +57,49 @@ UNOBSERVABLE_ACTIVITY = frozenset(
 
 def _utc_now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+class _RuntimeCall[T]:
+    """Own a blocking SDK call without registering an interpreter-exit join.
+
+    A failed cleanup retains this handle and the writer reservation. Daemon
+    status only permits CLI exit after abort_error; success still requires the
+    actual thread to finish and be joined.
+    """
+
+    def __init__(self, operation: Callable[[], T], name: str):
+        loop = asyncio.get_running_loop()
+        self._done = asyncio.Event()
+        self._value: T | None = None
+        self._error: BridgeError | None = None
+
+        def invoke() -> None:
+            try:
+                self._value = operation()
+            except BridgeError as error:
+                self._error = BridgeError(error.category)
+            except BaseException:
+                # Never let a background thread print an untrusted traceback.
+                self._error = BridgeError("internal_error")
+            finally:
+                with suppress(RuntimeError):  # The CLI may already have exited.
+                    loop.call_soon_threadsafe(self._done.set)
+
+        self.thread = threading.Thread(target=invoke, name=name, daemon=True)
+        self.thread.start()
+
+    async def wait(self, timeout: float | None = None) -> T:  # noqa: ASYNC109
+        # This owned call applies one asyncio.timeout to completion AND join.
+        async with asyncio.timeout(timeout):
+            await self._done.wait()
+            # The notification is sent just before the thread returns. Verify
+            # thread termination as well, without blocking the event loop.
+            while self.thread.is_alive():  # noqa: ASYNC110 -- no async Thread.join API
+                await asyncio.sleep(0.001)
+            self.thread.join(timeout=0)
+        if self._error is not None:
+            raise self._error
+        return cast(T, self._value)
 
 
 @dataclass
@@ -108,14 +151,15 @@ class TaskManager:
         self._active: Task | None = None
         self._condition = asyncio.Condition()
         self._cleanup = asyncio.Lock()
-        self._executor: ThreadPoolExecutor | None = None
+        self._run_call: _RuntimeCall[RunResult] | None = None
         self._closed = False
         self._poisoned = False
         self._loop: asyncio.AbstractEventLoop | None = None
         self._activity_lock = threading.Lock()
         self._activity_queue: list[tuple[Task, str]] = []
         self._pending_notify: set[asyncio.Task[None]] = set()
-        self._pending_close: set[asyncio.Task[None]] = set()
+        self._close_call: _RuntimeCall[None] | None = None
+        self._force_call: _RuntimeCall[bool] | None = None
 
     def _transition(self, task: Task, status: Status) -> None:
         allowed = {
@@ -217,8 +261,6 @@ class TaskManager:
         self._active = task
         self._loop = asyncio.get_running_loop()
         self._reset_run(task)
-        if self._executor is None:
-            self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="deepseek-worker")
         task.worker = asyncio.create_task(self._execute(task, message, fresh))
         task.watchdog = asyncio.create_task(self._watch(task))
 
@@ -274,15 +316,11 @@ class TaskManager:
         finish_reason = None
         activity = self._activity_callback(task)
         try:
-            result = await asyncio.get_running_loop().run_in_executor(
-                self._executor,
-                self.runtime.run,
-                task.session_id,
-                message,
-                fresh,
-                task.stop,
-                activity,
+            self._run_call = _RuntimeCall(
+                lambda: self.runtime.run(task.session_id, message, fresh, task.stop, activity),
+                "deepseek-worker-run",
             )
+            result = await self._run_call.wait()
             finish_reason = result.finish_reason
             response = parse_final(result.final_response)
             if response.status == "failed":
@@ -295,11 +333,14 @@ class TaskManager:
         if task.stopping:
             return
         if error:
-            try:
-                await asyncio.to_thread(self.runtime.close)
-            except Exception:
-                self._poisoned = True
-                error = BridgeError("abort_error")
+            async with self._cleanup:
+                if task.stopping:
+                    return
+                try:
+                    await self._close_runtime()
+                except Exception:
+                    self._poisoned = True
+                    error = BridgeError("abort_error")
         async with self._condition:
             if task.stopping:
                 return
@@ -310,6 +351,7 @@ class TaskManager:
             task.finish_reason = finish_reason
             self._transition(task, "failed" if error else response.status if response else "failed")
             if not self._poisoned:
+                self._run_call = None
                 self._active = None
 
     @staticmethod
@@ -369,7 +411,7 @@ class TaskManager:
                 task.error = BridgeError("task_timeout_error")
                 self._condition.notify_all()
             # Keep _cleanup across the whole timeout recovery so abort/shutdown
-            # cannot start a second close/executor shutdown for the same task.
+            # cannot start a second recovery for the same task.
             with suppress(BridgeError):
                 await self._stop(task, "failed")
         return True
@@ -391,31 +433,42 @@ class TaskManager:
             self._transition(task, status)
             self._active = None
 
-    async def _recover_resources(self, task: Task | None) -> None:
-        # The graceful close may block indefinitely on a stuck SDK pipe write;
-        # every wait below is bounded, and a pending close task is never cancelled.
+    async def _close_runtime(self) -> None:
         process = self.runtime.owned_process()
-        # Reuse an unfinished close task: its stuck thread may still own the
-        # runtime lifecycle lock, so starting a second close would only block.
-        close_task = next((pending for pending in self._pending_close if not pending.done()), None)
-        if close_task is None:
-            close_task = asyncio.create_task(asyncio.to_thread(self.runtime.close))
-            self._pending_close.add(close_task)
-            close_task.add_done_callback(self._pending_close.discard)
-        done, _ = await asyncio.wait({close_task}, timeout=CLEANUP_GRACE_SECONDS)
-        if not done:
-            # Force-stop only the captured owned process so close can unblock,
-            # then join the close task with a second fixed bound.
-            forced = await asyncio.to_thread(self.runtime.force_stop)
-            if not forced:
-                raise BridgeError("abort_error")
-            done, _ = await asyncio.wait({close_task}, timeout=CLEANUP_JOIN_SECONDS)
-        if not done:
-            raise BridgeError("abort_error")
-        if close_task.exception() is not None:
-            raise BridgeError("abort_error")
+        # Retain unfinished calls across failed recovery attempts. They are
+        # never cancelled or duplicated and cannot block asyncio.run()/atexit.
+        if self._close_call is None:
+            self._close_call = _RuntimeCall(self.runtime.close, "deepseek-worker-close")
+        close = self._close_call
+        try:
+            timed_out = False
+            try:
+                await close.wait(CLEANUP_GRACE_SECONDS)
+            except TimeoutError:
+                timed_out = True
+            if timed_out or self._force_call is not None:
+                if self._force_call is None:
+                    self._force_call = _RuntimeCall(
+                        self.runtime.force_stop, "deepseek-worker-force-stop"
+                    )
+                if not await self._force_call.wait(CLEANUP_FORCE_SECONDS):
+                    raise BridgeError("abort_error")
+                await close.wait(CLEANUP_JOIN_SECONDS)
+        finally:
+            if not close.thread.is_alive():
+                self._close_call = None
+            if self._force_call is not None and not self._force_call.thread.is_alive():
+                self._force_call = None
         if process is not None and process.poll() is None:
             raise BridgeError("abort_error")
+
+    async def _recover_resources(self, task: Task | None) -> None:
+        await self._close_runtime()
+        if self._run_call is not None:
+            # Closing a running SDK normally makes run raise. Its result may
+            # fail, but its actual thread must be joined before releasing it.
+            with suppress(BridgeError):
+                await self._run_call.wait(CLEANUP_JOIN_SECONDS)
         if task is not None and task.worker is not None:
             done, _ = await asyncio.wait({task.worker}, timeout=CLEANUP_JOIN_SECONDS)
             if not done:
@@ -424,16 +477,7 @@ class TaskManager:
                 task.worker.result()
             except Exception:
                 raise BridgeError("abort_error") from None
-        if self._executor is not None:
-            # executor.shutdown(wait=True) runs only after worker termination.
-            try:
-                await asyncio.wait_for(
-                    asyncio.to_thread(self._executor.shutdown, wait=True, cancel_futures=True),
-                    EXECUTOR_JOIN_SECONDS,
-                )
-            except Exception:
-                raise BridgeError("abort_error") from None
-            self._executor = None
+        self._run_call = None
 
     async def abort(self, task_id: str) -> dict[str, str]:
         try:
@@ -473,9 +517,13 @@ class TaskManager:
                 await self._stop(task, "interrupted")
             else:
                 # A terminal task may still hold the reservation after a failed
-                # cleanup, and an idle runtime/executor must be reclaimed too.
+                # cleanup, and an idle runtime must be reclaimed too.
                 # Reuse a stuck pending close instead of starting a second one;
                 # publish reclamation only after the bounded recovery succeeds.
-                await self._recover_resources(task)
+                try:
+                    await self._recover_resources(task)
+                except Exception:
+                    self._poisoned = True
+                    raise BridgeError("abort_error") from None
                 async with self._condition:
                     self._active = None
