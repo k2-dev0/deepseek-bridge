@@ -138,6 +138,9 @@ async def test_concurrent_start_and_continue_have_one_winner(gate, repo):
 def test_task_timeout_defaults(gate):
     assert gate.HARD_TIMEOUT_SECONDS == 20 * 60
     assert gate.INACTIVITY_TIMEOUT_SECONDS == 120
+    assert gate.CLEANUP_GRACE_SECONDS > 0
+    assert gate.CLEANUP_JOIN_SECONDS > 0
+    assert gate.EXECUTOR_JOIN_SECONDS > 0
 
 
 def utc(value):
