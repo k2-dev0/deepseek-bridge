@@ -6,10 +6,12 @@ import os
 import re
 import subprocess
 import threading
+from collections.abc import Callable
+from contextlib import suppress
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from deepseek_harness import DeepSeekHarness, RunResult
+from deepseek_harness import DeepSeekHarness, Notification, RunResult
 from deepseek_harness.errors import JsonRpcError, SdkProtocolError, TransportClosedError
 from deepseek_harness_runtime import bundled_runtime_path
 
@@ -20,6 +22,37 @@ from .protocol import COMMON_INSTRUCTIONS, BridgeError, ErrorClass
 SDK_VERSION = "0.1.5rc1"
 MODEL = "deepseek-flash"
 PROFILE = "sdk-minimal"
+
+# Only fixed activity tokens cross from the SDK callback into TaskManager.
+# Event bodies, tool arguments, messages and exception text never leave this module.
+_EVENT_ACTIVITY: dict[str, str] = {
+    "turn/start": "turn_start",
+    "turn/end": "turn_end",
+    "step/start": "step_start",
+    "step/end": "step_end",
+    "tool/call": "tool_call",
+    "tool/result": "tool_result",
+    "assistant/attempt": "model_attempt",
+    "assistant/message": "assistant_message",
+    "user/message": "user_message",
+    "system/message": "system_message",
+}
+
+
+def notification_activity(notification: Notification, session_id: str) -> str | None:
+    """Map one SDK notification to a fixed token, or None for anything unknown."""
+    if notification.method != "session.event":
+        return None
+    payload = notification.payload
+    if not isinstance(payload, dict) or payload.get("sessionId") != session_id:
+        return None
+    event = payload.get("event")
+    if not isinstance(event, dict):
+        return None
+    event_type = event.get("type")
+    if not isinstance(event_type, str):
+        return None
+    return _EVENT_ACTIVITY.get(event_type)
 
 
 def bind_workspace(cwd: Path | None = None) -> Path:
@@ -92,6 +125,8 @@ def classify_model_failure(detail: str) -> ErrorClass:
     value = detail.lower()
     if re.search(r"\b401\b|authentication|unauthorized|invalid.api.key", value):
         return "authentication_error"
+    if re.search(r"\btransport\b", value, re.IGNORECASE):
+        return "transport_error"
     if re.search(
         r"\b429\b|\b5\d\d\b|rate.limit|overload|fetch failed|network|timeout|connection", value
     ):
@@ -107,7 +142,19 @@ class Runtime:
         self.harness: DeepSeekHarness | None = None
         self._lifecycle = threading.Lock()
 
-    def run(self, session_id: str, message: str, fresh: bool, stop: threading.Event) -> RunResult:
+    def run(
+        self,
+        session_id: str,
+        message: str,
+        fresh: bool,
+        stop: threading.Event,
+        activity: Callable[[str], None] | None = None,
+    ) -> RunResult:
+        def report(token: str) -> None:
+            if activity is not None:
+                with suppress(Exception):
+                    activity(token)
+
         # Serialize lazy initialization with close. Initialization has a finite
         # SDK timeout; a cancellation received during it wins before session.run.
         with self._lifecycle:
@@ -135,17 +182,25 @@ class Runtime:
                         shutdown_timeout_seconds=2.0,
                     )
                     self.harness.start()
+                    report("process_start")
                 except Exception:
                     # TaskManager will close an instance even after partial startup.
                     raise BridgeError("harness_start_error") from None
             session = self.harness.start_session(session_id)
         if stop.is_set():
             raise BridgeError("abort_error")
+        report("run_start")
         prompt = COMMON_INSTRUCTIONS + "\nTask:\n" + message if fresh else message
+
+        def on_notification(notification: Notification) -> None:
+            token = notification_activity(notification, session_id)
+            if token is not None:
+                report(token)
+
         try:
             # Session.run does not lazily start a runtime. A close between the
             # check above and this call fails the send; it cannot resurrect it.
-            result: RunResult = session.run(prompt)
+            result: RunResult = session.run(prompt, on_notification=on_notification)
         except (SdkProtocolError, TransportClosedError):
             raise BridgeError("harness_protocol_error") from None
         except JsonRpcError as error:
