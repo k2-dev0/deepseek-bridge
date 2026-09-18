@@ -418,15 +418,15 @@ def test_git_execution_git_configuration_environment(endpoint, wire_env, monkeyp
     monkeypatch.setenv("WIRE_SECRET_CANARY", "must-not-reach")
     monkeypatch.setenv("WIRE_PASSWORD_CANARY", "must-not-reach")
     monkeypatch.setenv("WIRE_TOKEN_CANARY", "must-not-reach")
-    checks = " && ".join(f"git config --get {key} >/dev/null" for key, _ in settings)
+    monkeypatch.setenv("WIRE_OTHER_KEY", "must-not-reach")
+    checks = " && ".join(f'test "$(git config --get {key})" = "{value}"' for key, value in settings)
     endpoint["command"] = (
         "echo ENV_COUNT=$GIT_CONFIG_COUNT; "
         "echo KEY_COUNT=$(printenv | grep -c GIT_CONFIG_KEY_); "
         "echo VALUE_COUNT=$(printenv | grep -c GIT_CONFIG_VALUE_); "
         "echo SECRET_CANARY_COUNT=$(printenv | grep -ci -e WIRE_SECRET_CANARY "
-        "-e WIRE_PASSWORD_CANARY -e WIRE_TOKEN_CANARY); "
-        + checks
-        + " && echo GIT_CONFIG_GET=0 || echo GIT_CONFIG_GET=1"
+        "-e WIRE_PASSWORD_CANARY -e WIRE_TOKEN_CANARY -e WIRE_OTHER_KEY "
+        "-e DEEPSEEK_API_KEY); " + checks + " && echo GIT_CONFIG_GET=0 || echo GIT_CONFIG_GET=1"
     )
     runner = bridge("runtime").Runtime(wire_env)
     try:
@@ -491,10 +491,28 @@ async def test_git_execution_pager_bypass_without_terminal_environment(
     assert not any(t.name.startswith("deepseek-worker") for t in threading.enumerate())
 
 
+def test_git_execution_explicit_pager_remains_available(endpoint, wire_env):
+    checkout = Path(__file__).resolve().parents[1]
+    endpoint["mode"] = "tool"
+    endpoint["command"] = (
+        f"GIT_PAGER='printf PAGER_ACTIVE; cat' git --paginate -C {checkout} "
+        "log --format=format:fixture -1; printf PAGER_FINISHED"
+    )
+    runner = bridge("runtime").Runtime(wire_env)
+    try:
+        runner.run(
+            "session-" + uuid.uuid4().hex, "Run the explicit pager fixture", True, threading.Event()
+        )
+    finally:
+        runner.close()
+    results = [m for m in endpoint["requests"][-1]["messages"] if m.get("role") == "tool"]
+    observed = json.dumps(results)
+    assert "PAGER_ACTIVE" in observed
+    assert "PAGER_FINISHED" in observed
+
+
 @pytest.mark.parametrize("form", ["heredoc", "python"])
-async def test_execution_shell_preserves_literal_exclamation(
-    endpoint, wire_env, monkeypatch, form
-):
+async def test_execution_shell_preserves_literal_exclamation(endpoint, wire_env, monkeypatch, form):
     tasks = bridge("tasks")
     monkeypatch.setattr(tasks, "INACTIVITY_TIMEOUT_SECONDS", 5)
     monkeypatch.setattr(tasks, "HARD_TIMEOUT_SECONDS", 20)
@@ -515,9 +533,7 @@ async def test_execution_shell_preserves_literal_exclamation(
         assert result["status"] == "completed", result["error"]
         assert (wire_env / "literal.txt").read_text() == expected
         messages = endpoint["requests"][-1]["messages"]
-        assert any(
-            m.get("role") == "tool" and "EXECUTION_DONE" in json.dumps(m) for m in messages
-        )
+        assert any(m.get("role") == "tool" and "EXECUTION_DONE" in json.dumps(m) for m in messages)
     finally:
         await manager.shutdown()
     assert not any(t.name.startswith("deepseek-worker") for t in threading.enumerate())
