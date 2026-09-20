@@ -160,7 +160,7 @@ task状態はメモリ内のみ。再起動後は以前のIDを受け付けず�
 独立したsearch/readはsame stepへまとめ、already read fileをre-readしない指示も含む。
 判断が必要なら`needs_decision`を要求する。repositoryコードや環境変数一覧を共通指示へ埋め込まない。
 
-最終応答はMarkdown fenceなしのJSON object。以下の6 fieldをすべて必須とし、未知field、重複key、型違いを拒否する。
+workerへの指示はMarkdown fenceなしのJSON object。公開する最終応答は以下の6 fieldをすべて必須とし、後述の限定修復後も未知field、重複key、型違いを拒否する。
 
 | Field | 制約 |
 |---|---|
@@ -174,6 +174,14 @@ task状態はメモリ内のみ。再起動後は以前のIDを受け付けず�
 応答全体は最大16,000文字。超過を切り詰めず`task_contract_error`にする。
 credentialはJSON decode後にも検査する。SDKが正常終了しても契約違反を成功にしない。
 modelが主張するテスト結果の事実確認・reviewはMCP clientの責務。
+
+既知の報告形式のぶれだけを、追加API通信・モデル再依頼・ツール再実行なしで修復する。
+- 全文が単一の三連バッククォートの囲み（`json`指定または言語指定なし、本文の前後に改行あり、囲み外は空白だけ）なら、囲みを外す。LF/CRLFに対応する。
+- 既存の`unresolved`配列とともに`unresolved_note`がある場合、nullならその空項目を除き、文字列なら内容をそのまま`unresolved`末尾へ移す。他の型は拒否する。
+
+修復後に同じFinalResponse検査を適用する。必須項目の補完、状態の成功への書換え、未知項目の一括削除、メモの切捨ては行わない。追加メモで50件や各500文字の上限を超えても拒否する。
+説明文付きJSON・複数囲み・他言語指定・壊れたJSONは修復しない。元応答の16,000文字上限、raw/decode後のcredential検査、重複key拒否は修復前後でも維持する。修復によって元の報告本文を診断へ出力しない。
+この修正の反映にはbridge再起動が必要。既にfailedとなったtaskの状態を遡って変更したり、残った作業ファイルを再編集したりはしない。
 
 ## Privacyとlocal state
 
