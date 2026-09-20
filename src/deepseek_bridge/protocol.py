@@ -208,9 +208,20 @@ def parse_final(response: str) -> FinalResponse:
     try:
         if len(response) > 16000 or contains_credential(response):
             raise ValueError("Response exceeds the contract")
-        value = json.loads(response, object_pairs_hook=_unique_object)
+        text = response.strip()
+        fenced = re.fullmatch(r"```(?:json)?\r?\n(.*)\r?\n```", text, re.DOTALL)
+        value = json.loads(fenced.group(1) if fenced else text, object_pairs_hook=_unique_object)
         if contains_credential(json.dumps(value, ensure_ascii=False)):
             raise ValueError("Decoded response contains a credential")
+        if isinstance(value, dict) and "unresolved_note" in value:
+            unresolved = value.get("unresolved")
+            if not isinstance(unresolved, list):
+                raise ValueError("unresolved_note requires an unresolved list")
+            note = value.pop("unresolved_note")
+            if note is not None:
+                if not isinstance(note, str):
+                    raise ValueError("unresolved_note must be null or a string")
+                unresolved.append(note)
         return FinalResponse.model_validate(value)
     except (ValueError, TypeError, RecursionError, ValidationError):
         raise BridgeError("task_contract_error") from None
