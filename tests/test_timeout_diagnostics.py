@@ -72,12 +72,12 @@ async def test_model_wait_survives_ordinary_deadline(sdk_gate, repo, clock):
         (("step/start",), 600, "inactivity", "model", 600),
         (("step/start", "system/message", "user/message"), 600, "inactivity", "model", 600),
         (("step/start", "assistant/attempt"), 600, "inactivity", "model", 600),
-        (("step/start", "assistant/message", "tool/call"), 120, "inactivity", "activity", 120),
-        (("step/start", "tool/result"), 120, "inactivity", "activity", 120),
-        (("step/start", "step/end"), 120, "inactivity", "activity", 120),
-        (("step/start", "turn/end"), 120, "inactivity", "activity", 120),
-        (("assistant/attempt",), 120, "inactivity", "activity", 120),
-        ((), 120, "inactivity", "activity", 120),
+        (("step/start", "assistant/message", "tool/call"), 300, "inactivity", "activity", 300),
+        (("step/start", "tool/result"), 300, "inactivity", "activity", 300),
+        (("step/start", "step/end"), 300, "inactivity", "activity", 300),
+        (("step/start", "turn/end"), 300, "inactivity", "activity", 300),
+        (("assistant/attempt",), 300, "inactivity", "activity", 300),
+        ((), 300, "inactivity", "activity", 300),
         (("step/start",), 1200, "hard", "model", 1200),
     ],
 )
@@ -111,6 +111,31 @@ async def test_timeout_captures_pre_stop_state(
         await manager.shutdown()
 
 
+async def test_activity_boundary_running_at_299_and_timeout_at_300(sdk_gate, repo, clock):
+    manager = bridge("tasks").TaskManager(repo)
+    try:
+        task_id = await start(manager, sdk_gate)
+        await emit(sdk_gate, "tool/call")
+        before = await manager.wait(task_id, 0)
+        await advance(manager, task_id, clock, 299)
+        live = await manager.wait(task_id, 10)
+        assert live["status"] == "running"
+        assert live["last_activity_at"] == before["last_activity_at"]
+        await advance(manager, task_id, clock, 1)
+        result = await manager.wait(task_id, 1000)
+        assert result["status"] == "failed"
+        assert result["error"]["class"] == "task_timeout_error"
+        info = diagnostics(result)
+        assert info["timeout"] == "inactivity"
+        assert info["phase"] == "tool_call"
+        assert float(info["inactivity_seconds"]) == 300
+        assert float(info["deadline_seconds"]) == 300
+        assert info["waiting_for"] == "activity"
+    finally:
+        sdk_gate.release.set()
+        await manager.shutdown()
+
+
 async def test_hard_limit_with_recent_model_activity(sdk_gate, repo, clock):
     manager = bridge("tasks").TaskManager(repo)
     try:
@@ -133,7 +158,7 @@ async def test_unknown_notifications_cannot_hide_tool_stall(sdk_gate, repo, cloc
         task_id = await start(manager, sdk_gate)
         await emit(sdk_gate, "tool/call")
         before = await manager.wait(task_id, 0)
-        clock[0] += 119
+        clock[0] += 299
         for method, session_id, event_type in (
             ("session.event", sdk_gate.session_id, "heartbeat"),
             ("session.event", "another-session", "step/start"),
@@ -153,7 +178,7 @@ async def test_unknown_notifications_cannot_hide_tool_stall(sdk_gate, repo, cloc
         await advance(manager, task_id, clock, 1)
         info = diagnostics(await manager.wait(task_id, 1000))
         assert info["phase"] == "tool_call"
-        assert float(info["inactivity_seconds"]) == 120
+        assert float(info["inactivity_seconds"]) == 300
     finally:
         sdk_gate.release.set()
         await manager.shutdown()
@@ -170,7 +195,7 @@ async def test_cleanup_failure_retains_timeout_diagnosis(sdk_gate, repo, clock, 
         task_id = await start(manager, sdk_gate)
         await emit(sdk_gate, "tool/call")
         monkeypatch.setattr(manager.runtime, "close", fail_close)
-        await advance(manager, task_id, clock, 120)
+        await advance(manager, task_id, clock, 300)
         result = await manager.wait(task_id, 1000)
         assert result["error"]["class"] == "abort_error"
         assert diagnostics(result)["timeout"] == "inactivity"
@@ -194,7 +219,7 @@ async def test_continue_clears_model_wait(sdk_gate, repo, clock):
         await manager.continue_task(task_id, "Next run")
         assert await asyncio.to_thread(sdk_gate.entered.wait, 2)
         await asyncio.sleep(0)
-        await advance(manager, task_id, clock, 120)
+        await advance(manager, task_id, clock, 300)
         info = diagnostics(await manager.wait(task_id, 1000))
         assert info["waiting_for"] == "activity"
         assert info["phase"] == "run_start"
