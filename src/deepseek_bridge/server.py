@@ -81,7 +81,20 @@ async def serve() -> None:
         try:
             if params.name not in INPUTS:
                 raise BridgeError("configuration_error")
-            value = INPUTS[params.name].model_validate(params.arguments or {})
+            try:
+                value = INPUTS[params.name].model_validate(params.arguments or {})
+            except ValidationError:
+                if params.name != "start_task":
+                    raise
+                rejection = {
+                    **BridgeError("configuration_error").as_dict(),
+                    "rejection": "input_validation",
+                    "execution_started": False,
+                }
+                return types.CallToolResult(
+                    is_error=True,
+                    content=[types.TextContent(type="text", text=json.dumps(rejection))],
+                )
             if isinstance(value, StartInput):
                 result = await manager.start(value.brief, value.title)
             elif isinstance(value, WaitInput):
