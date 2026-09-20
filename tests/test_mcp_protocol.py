@@ -144,11 +144,221 @@ async def test_stdio_tools_and_invalid_inputs(repo, tmp_path, entrypoint):
             )
             result = await receive()
             assert result.get("error") or result["result"]["isError"]
+            assert result["result"]["isError"] is True
+            content = result["result"]["content"]
+            assert len(content) == 1
+            assert content[0]["type"] == "text"
+            # This SDK passes arguments through to the handler: the extra key
+            # is an INPUTS model failure, not an SDK-layer schema rejection.
+            assert json.loads(content[0]["text"]) == {
+                "class": "configuration_error",
+                "message": "Invalid configuration, input, task ID, or task state.",
+                "rejection": "input_validation",
+                "execution_started": False,
+            }
             assert "top-secret" not in json.dumps(result)
         process.stdin.close()
         assert await asyncio.wait_for(process.wait(), 10) == 0
         assert await process.stdout.read() == b""
         assert b"mcp-fixture-key" not in await process.stderr.read()
+    finally:
+        if process.returncode is None:
+            process.kill()
+            await process.wait()
+
+
+async def test_input_rejection_never_starts_manager(repo, tmp_path):
+    bridge("server")
+    canary = "red-canary-4f19"
+    credential = "api" + "_key=" + canary
+    audit = tmp_path / "start-calls.json"
+    # Real stdio transport and server; only TaskManager is replaced so the
+    # audit sees whether input rejection ever reaches manager.start.
+    script = f"""
+import json
+from pathlib import Path
+from deepseek_bridge import server
+from deepseek_bridge.protocol import BridgeError, StartInput
+
+audit = Path({str(audit)!r})
+audit.write_text("[]")
+calls = []
+
+class AuditManager:
+    def __init__(self, workspace):
+        pass
+
+    def _record(self, tool, **values):
+        calls.append({{"tool": tool, **values}})
+        audit.write_text(json.dumps(calls))
+
+    async def start(self, brief, title=None):
+        self._record("start", brief=brief, title=title)
+        if brief == "audit-bridge-error":
+            raise BridgeError("configuration_error")
+        if brief == "audit-internal-validation":
+            StartInput.model_validate({{"brief": " "}})
+        return {{
+            "task_id": f"task-audit-{{len(calls)}}",
+            "session_id": "session-audit",
+            "status": "running",
+        }}
+
+    async def wait(self, task_id):
+        self._record("wait", task_id=task_id)
+        return {{
+            "task_id": task_id,
+            "session_id": "session-audit",
+            "status": "completed",
+            "phase": "completed",
+            "observability": "available",
+        }}
+
+    async def continue_task(self, task_id, message):
+        self._record("continue_task", task_id=task_id)
+        return {{"task_id": task_id, "session_id": "session-audit", "status": "running"}}
+
+    async def abort(self, task_id):
+        self._record("abort", task_id=task_id)
+        return {{"task_id": task_id, "session_id": "session-audit", "status": "aborted"}}
+
+    async def shutdown(self):
+        pass
+
+server.TaskManager = AuditManager
+server.main()
+"""
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        script,
+        cwd=server_cwd(repo),
+        env={
+            **os.environ,
+            "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"),
+            "DEEPSEEK_API_KEY": "mcp-fixture-key",
+        },
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    async def send(value):
+        process.stdin.write((json.dumps(value) + "\n").encode())
+        await process.stdin.drain()
+
+    async def receive():
+        return json.loads(await asyncio.wait_for(process.stdout.readline(), 10))
+
+    async def call(request_id, name, arguments):
+        await send(
+            {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "tools/call",
+                "params": {"name": name, "arguments": arguments},
+            }
+        )
+        return await receive()
+
+    rejection = {
+        "class": "configuration_error",
+        "message": "Invalid configuration, input, task ID, or task state.",
+        "rejection": "input_validation",
+        "execution_started": False,
+    }
+    old_error = {
+        "class": "configuration_error",
+        "message": "Invalid configuration, input, task ID, or task state.",
+    }
+    try:
+        await send(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {},
+                    "clientInfo": {"name": "audit-fixture", "version": "1"},
+                },
+            }
+        )
+        assert (await receive())["id"] == 1
+        await send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+
+        for index, arguments in enumerate(
+            (
+                {"brief": " "},
+                {"brief": credential},
+                {"brief": "audit-title-brief", "title": " "},
+            ),
+            2,
+        ):
+            result = await call(index, "start_task", arguments)
+            assert result["result"]["isError"] is True
+            content = result["result"]["content"]
+            assert len(content) == 1
+            assert content[0]["type"] == "text"
+            parsed = json.loads(content[0]["text"])
+            assert parsed == rejection
+            assert parsed["execution_started"] is False
+            assert "task_id" not in json.dumps(result)
+            assert canary not in json.dumps(result)
+            assert credential not in json.dumps(result)
+            assert json.loads(audit.read_text()) == []
+
+        accepted = await call(5, "start_task", {"brief": "audit-normal-brief"})
+        assert accepted["result"]["isError"] is False
+        assert accepted["result"]["structuredContent"]["task_id"] == "task-audit-1"
+        assert json.loads(audit.read_text()) == [
+            {"tool": "start", "brief": "audit-normal-brief", "title": None}
+        ]
+
+        for index, brief in enumerate(("audit-bridge-error", "audit-internal-validation"), 6):
+            result = await call(index, "start_task", {"brief": brief})
+            assert result["result"]["isError"] is True
+            content = result["result"]["content"]
+            assert len(content) == 1
+            assert content[0]["type"] == "text"
+            assert json.loads(content[0]["text"]) == old_error
+            assert "rejection" not in json.dumps(result)
+            assert "execution_started" not in json.dumps(result)
+        # Both starts were called; only the input boundary gets the marker.
+        assert [entry["brief"] for entry in json.loads(audit.read_text())] == [
+            "audit-normal-brief",
+            "audit-bridge-error",
+            "audit-internal-validation",
+        ]
+
+        for index, (name, arguments) in enumerate(
+            (
+                ("continue_task", {"task_id": "task-audit-1", "message": " "}),
+                ("unknown_tool", {}),
+            ),
+            8,
+        ):
+            result = await call(index, name, arguments)
+            assert result["result"]["isError"] is True
+            assert json.loads(result["result"]["content"][0]["text"]) == old_error
+            assert "rejection" not in json.dumps(result)
+            assert "execution_started" not in json.dumps(result)
+
+        # The SDK rejects a wrong-typed arguments member before the handler, so
+        # that old JSON-RPC error cannot serve as the new non-start proof.
+        sdk_rejected = await call(10, "start_task", "not-an-object")
+        assert sdk_rejected["error"]["code"] == -32602
+        assert "result" not in sdk_rejected
+        assert "rejection" not in json.dumps(sdk_rejected)
+        assert "execution_started" not in json.dumps(sdk_rejected)
+        assert len(json.loads(audit.read_text())) == 3
+
+        process.stdin.close()
+        assert await asyncio.wait_for(process.wait(), 10) == 0
+        assert await process.stdout.read() == b""
+        stderr = await process.stderr.read()
+        assert b"mcp-fixture-key" not in stderr
+        assert canary.encode() not in stderr
     finally:
         if process.returncode is None:
             process.kill()
