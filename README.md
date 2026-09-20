@@ -137,7 +137,7 @@ failed taskの暗黙resumeはなく、runtime crash・abort後のfresh taskで�
 SDK protocolにcancel RPCがないため、abortは所有するruntimeの`close()`でshutdown、必要ならterminate/kill/waitを行う。
 初期化と終了を直列化し、初期化中の取消でmodel turnを始めない。初期化中のabortはSDKの30秒の初期化期限まで待つ場合がある。
 終了失敗は`abort_error`とし、新しいwriterを受け付けない。worktreeをGit reset/restore等で戻す処理はない。
-task全体のhard timeoutは20分。最終activityからのinactivity timeoutはモデル待ち中600秒、その他（起動・ツール実行等）は120秒。hardとinactivityが両方期限超過ならhardを診断理由にする。
+task全体のhard timeoutは20分。最終activityからのinactivity timeoutはモデル待ち中600秒、その他（起動・ツール実行等）は300秒。hardとinactivityが両方期限超過ならhardを診断理由にする。
 固定SDK 0.1.5rc1のRPCは`session.event`/`session.status`/subagent通知を公開するが、内部の`agent/assistant-stream`は転送しない。`assistant/attempt`は失敗・中断した応答の確定イベントであり、推論開始や途中deltaではない。架空のheartbeatでactivityを更新しない。
 `step/start`からモデル待ちを保持し、その後のsystem/user messageや失敗attemptでも維持する。assistant message・tool call/result・step/turn終了で通常の期限へ戻す。モデル準備もこの観測区間に含まれ、無応答と正常な長い推論を完全には区別できないため、600秒の有限期限と20分の全体上限を併用する。
 watchdogは単純sleepではなくconditionでactivity sequence/status変化を待ち、deadline到達後もcondition lock下で最新`last_activity_monotonic`とhard deadlineを再評価してからtimeout回収へ進む。
