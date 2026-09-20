@@ -94,6 +94,23 @@ MCP clientが対象repositoryをcwdとして起動し、必要な`DEEPSEEK_API_K
 
 `brief`/`message`は1〜32,000文字、`title`は1〜200文字。空白だけの入力、credentialらしい入力、環境に設定されたkeyの混入を拒否する。
 credential検出は防御の補助であり、任意形式のsecretをすべて見つける保証はない。secretをタスクへ渡さないこと。
+
+`start_task`の入力モデル検査が失敗し、TaskManagerの起動処理を呼んでいない場合に限り、MCPの`isError: true`と単一text contentのJSONで次を返す。
+
+```json
+{
+  "class": "configuration_error",
+  "message": "Invalid configuration, input, task ID, or task state.",
+  "rejection": "input_validation",
+  "execution_started": false
+}
+```
+
+これは当該要求で実行を開始していない証明であり、他taskの停止やmanager全体のidleを意味しない。task IDは発行しない。入力本文や検査エラーの詳細も返さない。
+呼出し元の保護hookは、所有者・起動呼出しID・task ID未発行の予約を照合したうえで、この明示的な拒否だけを解除対象にできる。`configuration_error`や`isError`だけで解除してはいけない。
+他toolの入力拒否、SDK層のJSON-RPC拒否、状態競合、manager内部のValidationErrorや実行エラーには、この印を付けない。
+既存class/messageと通常応答・wait schemaは維持するが、起動拒否JSONのキーを厳密に2個と仮定するconsumerは対応が必要。旧bridgeの曖昧なエラーからこの印を推定・捏造しない。反映にはbridge再起動と呼出し元hookの対応が必要。
+
 `wait_task`はSDK activityで起床せず、途中の進捗結果を返さない。activityは内部の停滞監視と最終snapshotへ反映する。wait requestの取消は実行taskの失敗・取消を意味しない。
 `continue_task`は同じsession履歴を再利用する。同じsessionへは差分・新情報だけを`message`で渡し、初回briefや確認済み要件を繰り返さない。明示的な訂正・追加はそのまま渡す。bridgeは`message`の自動要約・重複判定・文字列削除をしない。
 
