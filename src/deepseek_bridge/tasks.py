@@ -28,7 +28,7 @@ from .protocol import (
 from .runtime import Runtime
 
 HARD_TIMEOUT_SECONDS = 20 * 60
-INACTIVITY_TIMEOUT_SECONDS = 120
+INACTIVITY_TIMEOUT_SECONDS = 300
 # SDK 0.1.5rc1 does not forward agent/assistant-stream frames over its RPC.
 # Keep model waiting bounded without treating an invisible stream as a tool stall.
 MODEL_WAIT_TIMEOUT_SECONDS = 600
